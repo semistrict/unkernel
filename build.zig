@@ -142,6 +142,7 @@ pub fn build(b: *std.Build) void {
     });
     for (a64_guests) |name| addA64Guest(b, a64_target, name, b.fmt("test/guest/a64/{s}.c", .{name}));
     for (a64_ports) |p| addA64Guest(b, a64_target, p[0], p[1]);
+    addA64Guest(b, a64_target, "paravirt_bench", "test/guest/a64/paravirt_bench.c");
 
     // A64 coverage classifier (test/a64-coverage.mjs): which raw words the
     // interpreter rejects as ILLEGAL, and the group each one is routed to.
@@ -251,6 +252,7 @@ fn kwemuModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
 fn addA64Guest(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, src: []const u8) void {
     const mod = b.createModule(.{ .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    mod.addIncludePath(b.path("include"));
     mod.addCSourceFile(.{ .file = b.path(src), .flags = &.{ "-std=gnu11", "-Wall", "-fno-vectorize", "-fno-slp-vectorize" } });
     mod.linkSystemLibrary("m", .{});
     const exe = b.addExecutable(.{ .name = b.fmt("a64-{s}", .{name}), .root_module = mod, .linkage = .static });
