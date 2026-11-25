@@ -1551,41 +1551,47 @@ pub fn emit(e: *Emit, v: V, at: At) void {
 // ---- AdvSIMD FP fast paths --------------------------------------------------------
 
 const fpcr_off = cm.off(ops.nzcv_slot) + 4;
-const fpsr_off = fpcr_off + 4;
-const fpcr_fast_mask: i32 = @bitCast(c.FPCR_FZ | (3 << c.FPCR_RMODE_SHIFT));
+const fpcr_fast_mask: u64 = c.FPCR_FZ | (3 << c.FPCR_RMODE_SHIFT);
+const fpcr_wasm_mask: u64 = c.FPCR_WASM_MASK;
 
-fn fpcrFast(e: *Emit) void {
-    e.get(jc.l_x);
-    e.addr();
-    e.mem(W.i32_load, 2, fpcr_off);
-    e.k32(fpcr_fast_mask);
-    e.op(W.i32_and);
-    e.op(W.i32_eqz);
-}
-fn fzClear(e: *Emit) void {
-    e.get(jc.l_x);
-    e.addr();
-    e.mem(W.i32_load, 2, fpcr_off);
-    e.k32(@bitCast(c.FPCR_FZ));
-    e.op(W.i32_and);
-    e.op(W.i32_eqz);
-}
-fn ixcSet(e: *Emit) void {
-    e.get(jc.l_x);
-    e.addr();
-    e.mem(W.i32_load, 2, fpsr_off);
-    e.k32(@ctz(c.FPSR_IXC));
-    e.op(W.i32_shr_u);
-    e.k32(1);
-    e.op(W.i32_and);
-}
-/// Push the i32 "FPCR allows the fast path and both FPSR.IXC and FPSR.UFC are set".
-fn fastIxcUfc(e: *Emit) void {
-    const flags: u64 = @as(u64, c.FPSR_IXC | c.FPSR_UFC) << 32;
+fn loadWasmFp(e: *Emit, save: u32) void {
     e.get(jc.l_x);
     e.addr();
     e.mem(W.i64_load, 2, fpcr_off);
-    e.k64(@as(u64, @as(u32, @bitCast(fpcr_fast_mask))) | flags);
+    e.tee(save);
+    e.k64(fpcr_wasm_mask);
+    e.op(W.i64_and);
+    e.k64(c.FPCR_WASM_FP);
+    e.op(W.i64_eq);
+}
+fn fastIxcFrom(e: *Emit, l: u32) void {
+    const ixc: u64 = @as(u64, c.FPSR_IXC) << 32;
+    e.get(l);
+    e.k64(fpcr_fast_mask | ixc);
+    e.op(W.i64_and);
+    e.k64(ixc);
+    e.op(W.i64_eq);
+}
+fn fzClearFrom(e: *Emit, l: u32) void {
+    e.get(l);
+    e.k64(c.FPCR_FZ);
+    e.op(W.i64_and);
+    e.op(W.i64_eqz);
+}
+fn fzClearIxcFrom(e: *Emit, l: u32) void {
+    const ixc: u64 = @as(u64, c.FPSR_IXC) << 32;
+    e.get(l);
+    e.k64(@as(u64, c.FPCR_FZ) | ixc);
+    e.op(W.i64_and);
+    e.k64(ixc);
+    e.op(W.i64_eq);
+}
+/// Push the i32 "FPCR allows the fast path and both FPSR.IXC and FPSR.UFC are set"
+/// from FPCR and FPSR as `loadWasmFp` saved them in `lt`.
+fn fastIxcUfc(e: *Emit) void {
+    const flags: u64 = @as(u64, c.FPSR_IXC | c.FPSR_UFC) << 32;
+    e.get(lt);
+    e.k64(fpcr_fast_mask | flags);
     e.op(W.i64_and);
     e.k64(flags);
     e.op(W.i64_eq);
@@ -1674,6 +1680,13 @@ fn isZeroMask(e: *Emit, l: u32, dbl: bool) void {
 
 fn emitFpBin(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    getM(e, v);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const a_loc = lq;
     const b_loc = lq + 1;
     const r_loc = lq + 2;
@@ -1698,9 +1711,7 @@ fn emitFpBin(e: *Emit, v: V, at: At) void {
     }
     e.vop(v128_or);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fpcrFast(e);
-    e.op(W.i32_and);
-    ixcSet(e);
+    fastIxcFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(r_loc);
@@ -1717,10 +1728,17 @@ fn emitFpBin(e: *Emit, v: V, at: At) void {
     vecFpSlow(e, v, at);
     e.close();
     e.close();
+    e.close();
 }
 
 fn emitFpSqrt(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const r_loc = lq + 1;
     normOp(e, v, false, 0x4080_0000);
     vop(e, v.code);
@@ -1729,9 +1747,7 @@ fn emitFpSqrt(e: *Emit, v: V, at: At) void {
     isZeroMask(e, r_loc, dbl);
     e.vop(v128_or);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fpcrFast(e);
-    e.op(W.i32_and);
-    ixcSet(e);
+    fastIxcFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(r_loc);
@@ -1748,10 +1764,18 @@ fn emitFpSqrt(e: *Emit, v: V, at: At) void {
     vecFpSlow(e, v, at);
     e.close();
     e.close();
+    e.close();
 }
 
 fn emitFpMinmax(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    getM(e, v);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const r_loc = lq;
     normOp(e, v, false, 0x4080_0000);
     normOp(e, v, true, 0x3f80_0000);
@@ -1761,7 +1785,7 @@ fn emitFpMinmax(e: *Emit, v: V, at: At) void {
     e.get(r_loc);
     e.vop(if (dbl) cm.S.f64x2_eq else cm.S.f32x4_eq);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fzClear(e);
+    fzClearFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(r_loc);
@@ -1769,10 +1793,18 @@ fn emitFpMinmax(e: *Emit, v: V, at: At) void {
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
+    e.close();
 }
 
 fn emitFpCmp(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    getM(e, v);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const eq: u32 = if (dbl) cm.S.f64x2_eq else cm.S.f32x4_eq;
     const a_loc = lq;
     const b_loc = lq + 1;
@@ -1788,7 +1820,7 @@ fn emitFpCmp(e: *Emit, v: V, at: At) void {
     e.vop(eq);
     e.vop(v128_and);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fzClear(e);
+    fzClearFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(a_loc);
@@ -1798,10 +1830,18 @@ fn emitFpCmp(e: *Emit, v: V, at: At) void {
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
+    e.close();
 }
 
 fn emitFpCmp0(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    k128(e, 0, 0);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const eq: u32 = if (dbl) cm.S.f64x2_eq else cm.S.f32x4_eq;
     const a_loc = lq;
     normOp(e, v, false, 0x4080_0000);
@@ -1810,7 +1850,7 @@ fn emitFpCmp0(e: *Emit, v: V, at: At) void {
     e.get(a_loc);
     e.vop(eq);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fzClear(e);
+    fzClearFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(a_loc);
@@ -1819,6 +1859,7 @@ fn emitFpCmp0(e: *Emit, v: V, at: At) void {
     cm.setVq(e, v.d, v.q);
     e.op(W.@"else");
     vecFpSlow(e, v, at);
+    e.close();
     e.close();
 }
 
@@ -1992,9 +2033,7 @@ fn emitFpMla2D(e: *Emit, v: V, at: At) void {
     fmaRangeOrZero2D(e, d_loc, lq + 2);
     e.vop(v128_and);
     e.vop(cm.S.i64x2_all_true);
-    fpcrFast(e);
-    e.op(W.i32_and);
-    ixcSet(e);
+    fastIxcFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     // Dekker TwoProd(a=lq+1, b=lq+0) -> (p=lq+6, perr=lq+7)
@@ -2065,67 +2104,131 @@ fn emitFpMla2D(e: *Emit, v: V, at: At) void {
 }
 
 fn emitFpMla(e: *Emit, v: V, at: At) void {
-    if (v.size == 3) return emitFpMla2D(e, v, at);
+    const dbl = v.size == 3;
     const sub = v.x == 1;
-    const m_loc = lq;
-    const s_loc = lq + 1;
-    const r0_loc = lq + 2;
-    const r1_loc = lq + 3;
-    const ok_loc = lq + 4;
-    const a_loc = cm.vloc(v.n & 31);
-    const d_loc = cm.vloc(v.d & 31);
-    getM(e, v);
-    e.set(m_loc);
-    emitMlaPair(e, a_loc, m_loc, d_loc, false, sub, s_loc, r0_loc);
-    if (v.q) {
-        e.set(ok_loc);
-        emitMlaPair(e, a_loc, m_loc, d_loc, true, sub, s_loc, r1_loc);
-        e.get(ok_loc);
-        e.vop(v128_and);
-    }
-    e.vop(cm.S.i64x2_all_true);
-    fpcrFast(e);
-    e.op(W.i32_and);
-    ixcSet(e);
-    e.op(W.i32_and);
+    loadWasmFp(e, lt);
     e.open(W.@"if", W.void_t);
-    e.get(r0_loc);
-    if (v.q) {
-        e.get(r1_loc);
-        shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23 });
+    if (e.relaxed_fma) {
+        get(e, v.n);
+        getM(e, v);
+        get(e, v.d);
+        e.vop(if (dbl)
+            (if (sub) cm.S.f64x2_relaxed_nmadd else cm.S.f64x2_relaxed_madd)
+        else
+            (if (sub) cm.S.f32x4_relaxed_nmadd else cm.S.f32x4_relaxed_madd));
+    } else {
+        get(e, v.d);
+        get(e, v.n);
+        getM(e, v);
+        e.vop(if (dbl) cm.S.f64x2_mul else cm.S.f32x4_mul);
+        e.vop(if (dbl)
+            (if (sub) cm.S.f64x2_sub else cm.S.f64x2_add)
+        else
+            (if (sub) cm.S.f32x4_sub else cm.S.f32x4_add));
     }
-    cm.setV(e, v.d);
+    cm.setVq(e, v.d, v.q);
     e.op(W.@"else");
-    fastIxcUfc(e);
-    e.open(W.@"if", W.void_t);
-    emitMlaSubPair(e, a_loc, m_loc, d_loc, false, sub, r0_loc);
-    if (v.q) {
-        e.set(ok_loc);
-        emitMlaSubPair(e, a_loc, m_loc, d_loc, true, sub, r1_loc);
-        e.get(ok_loc);
-        e.vop(v128_and);
+    if (e.relaxed_fma) {
+        const r_loc = lq;
+        // Pad inactive lanes for Q = 0 (2S): d = 4.0, n = 1.0, m = 1.0 ->
+        // FMLA = 5.0, FMLS = 3.0 (both safely inRange).
+        normOp(e, v, false, 0x3f80_0000);
+        normOp(e, v, true, 0x3f80_0000);
+        get(e, v.d);
+        if (!v.q) {
+            k32x4(e, 0x4080_0000);
+            shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31 });
+        }
+        e.vop(if (dbl)
+            (if (sub) cm.S.f64x2_relaxed_nmadd else cm.S.f64x2_relaxed_madd)
+        else
+            (if (sub) cm.S.f32x4_relaxed_nmadd else cm.S.f32x4_relaxed_madd));
+        e.set(r_loc);
+        inRangeMask(e, r_loc, dbl);
+        e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
+        fastIxcFrom(e, lt);
+        e.op(W.i32_and);
+        e.open(W.@"if", W.void_t);
+        e.get(r_loc);
+        cm.setVq(e, v.d, v.q);
+        e.op(W.@"else");
+        fastIxcUfc(e);
+        finiteMask(e, r_loc, dbl);
+        e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
+        e.op(W.i32_and);
+        e.open(W.@"if", W.void_t);
+        e.get(r_loc);
+        cm.setVq(e, v.d, v.q);
+        e.op(W.@"else");
+        vecFpSlow(e, v, at);
+        e.close();
+        e.close();
+    } else if (dbl) {
+        emitFpMla2D(e, v, at);
+    } else {
+        const m_loc = lq;
+        const s_loc = lq + 1;
+        const r0_loc = lq + 2;
+        const r1_loc = lq + 3;
+        const ok_loc = lq + 4;
+        const a_loc = cm.vloc(v.n & 31);
+        const d_loc = cm.vloc(v.d & 31);
+        getM(e, v);
+        e.set(m_loc);
+        emitMlaPair(e, a_loc, m_loc, d_loc, false, sub, s_loc, r0_loc);
+        if (v.q) {
+            e.set(ok_loc);
+            emitMlaPair(e, a_loc, m_loc, d_loc, true, sub, s_loc, r1_loc);
+            e.get(ok_loc);
+            e.vop(v128_and);
+        }
+        e.vop(cm.S.i64x2_all_true);
+        fastIxcFrom(e, lt);
+        e.op(W.i32_and);
+        e.open(W.@"if", W.void_t);
+        e.get(r0_loc);
+        if (v.q) {
+            e.get(r1_loc);
+            shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23 });
+        }
+        cm.setV(e, v.d);
+        e.op(W.@"else");
+        fastIxcUfc(e);
+        e.open(W.@"if", W.void_t);
+        emitMlaSubPair(e, a_loc, m_loc, d_loc, false, sub, r0_loc);
+        if (v.q) {
+            e.set(ok_loc);
+            emitMlaSubPair(e, a_loc, m_loc, d_loc, true, sub, r1_loc);
+            e.get(ok_loc);
+            e.vop(v128_and);
+        }
+        e.vop(cm.S.i64x2_all_true);
+        e.open(W.@"if", W.void_t);
+        e.get(r0_loc);
+        if (v.q) {
+            e.get(r1_loc);
+            shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23 });
+        }
+        cm.setV(e, v.d);
+        e.op(W.@"else");
+        vecFpSlow(e, v, at);
+        e.close();
+        e.op(W.@"else");
+        vecFpSlow(e, v, at);
+        e.close();
+        e.close();
     }
-    e.vop(cm.S.i64x2_all_true);
-    e.open(W.@"if", W.void_t);
-    e.get(r0_loc);
-    if (v.q) {
-        e.get(r1_loc);
-        shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23 });
-    }
-    cm.setV(e, v.d);
-    e.op(W.@"else");
-    vecFpSlow(e, v, at);
-    e.close();
-    e.op(W.@"else");
-    vecFpSlow(e, v, at);
-    e.close();
     e.close();
 }
 
 fn emitFpCvtf(e: *Emit, v: V, at: At) void {
-    fpcrFast(e);
-    ixcSet(e);
-    e.op(W.i32_and);
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
+    fastIxcFrom(e, lt);
     e.open(W.@"if", W.void_t);
     get(e, v.n);
     vop(e, v.code);
@@ -2133,9 +2236,16 @@ fn emitFpCvtf(e: *Emit, v: V, at: At) void {
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
+    e.close();
 }
 
 fn emitFpCvtz(e: *Emit, v: V, at: At) void {
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const a_loc = lq;
     normOp(e, v, false, 0x4080_0000);
     e.set(a_loc);
@@ -2155,9 +2265,7 @@ fn emitFpCvtz(e: *Emit, v: V, at: At) void {
     }
     e.vop(v128_and);
     e.vop(cm.S.i32x4_all_true);
-    fzClear(e);
-    e.op(W.i32_and);
-    ixcSet(e);
+    fzClearIxcFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(a_loc);
@@ -2165,6 +2273,7 @@ fn emitFpCvtz(e: *Emit, v: V, at: At) void {
     cm.setVq(e, v.d, v.q);
     e.op(W.@"else");
     vecFpSlow(e, v, at);
+    e.close();
     e.close();
 }
 
@@ -2217,14 +2326,10 @@ fn ldstN(e: *Emit, v: V, at: At) void {
     const chunks: usize = (total + 15) / 16; // 1..4
     const esz: usize = @as(usize, 1) << v.size;
     const load = v.k == .ldn;
-    cm.get(e, v.n);
-    e.set(cm.l_va);
-    e.tlbCheck(at.k, at.pc, if (load) jc.tlb_r_off else jc.tlb_w_off, total);
-    if (e.mem32) e.op(W.i64_ext_u);
-    e.set(lu);
+    const a = mem.prepareHost(e, at, v.n, 0, !load, total);
     if (load) {
         for (0..chunks) |ci| {
-            e.get(lu);
+            e.get(a.local);
             e.addr();
             if (16 * ci + 16 <= total) {
                 e.vop(cm.S.v128_load);
@@ -2232,7 +2337,7 @@ fn ldstN(e: *Emit, v: V, at: At) void {
                 e.vop(cm.S.v128_load64_zero);
             }
             e.uleb(0);
-            e.uleb(16 * ci);
+            e.uleb(a.off + 16 * ci);
             e.set(lq + @as(u32, @intCast(ci)));
         }
         for (0..selem) |r| {
@@ -2292,7 +2397,7 @@ fn ldstN(e: *Emit, v: V, at: At) void {
         for (0..chunks) |ci| {
             const base_b = 16 * ci;
             const clen = @min(16, total - base_b);
-            e.get(lu);
+            e.get(a.local);
             e.addr();
             if (selem == 2) {
                 var idx: [16]u8 = @splat(0);
@@ -2354,11 +2459,11 @@ fn ldstN(e: *Emit, v: V, at: At) void {
             if (clen == 16) {
                 e.vop(cm.S.v128_store);
                 e.uleb(0);
-                e.uleb(16 * ci);
+                e.uleb(a.off + 16 * ci);
             } else {
                 e.vop(cm.S.v128_store64_lane);
                 e.uleb(0);
-                e.uleb(16 * ci);
+                e.uleb(a.off + 16 * ci);
                 e.op(0);
             }
         }

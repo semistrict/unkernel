@@ -380,8 +380,8 @@ test "a64 jit: paravirt decode routing and reserved UDF opcodes" {
     for (0..16) |i| {
         try t.expectEqual(decode.Group.paravirt, decode.route(base + @as(u32, @intCast(i))));
     }
-    // Reserved slots 0x0000_ff05..0x0000_ff0f and outside UDFs must raise EV_ILLEGAL.
-    for ([_]u32{ 0x0000_0000, 0x0000_feff, 0x0000_ff05, 0x0000_ff0f, 0x0000_ff10 }) |w| {
+    // Reserved slots 0x0000_ff05..0x0000_ff0f and outside UDFs (past fatwasm 0x0000_ff10..0x0000_ff1f) must raise EV_ILLEGAL.
+    for ([_]u32{ 0x0000_0000, 0x0000_feff, 0x0000_ff05, 0x0000_ff0f, 0x0000_ff20 }) |w| {
         var m = try Machine.init(t.allocator);
         defer m.deinit();
         m.code(0x10000, &.{ w, mach.svc0 });

@@ -12,7 +12,9 @@
 //                                    shared memory, bit 4 the kernel's table
 //                                    is offered as env.table
 //                                    (always, here), bit 5 the engine
-//                                    compiles fixed-width SIMD (v128)
+//                                    compiles fixed-width SIMD (v128), bit 6
+//                                    the engine compiles Relaxed-SIMD FMA and
+//                                    executes true single-rounded FMA
 //   kw_host_jit_compile(ptr, len, slot, flags) -> i32
 //                                    compile the module at ptr (it imports
 //                                    env.memory and maybe env.table, exports
@@ -162,15 +164,53 @@ const CAP_SHARED = 8;
 const CAP_TABLE = 16;
 /** The engine compiles fixed-width SIMD: kwemu may emit v128 code. */
 const CAP_SIMD = 32;
+/** The engine compiles Relaxed-SIMD FMA with true single rounding. */
+const CAP_RELAXED_FMA = 64;
 /**
  * A module whose function returns i8x16.popcnt(i8x16.splat(0)): engines
  * without SIMD (V8 on an x86-64 without SSE4.1) do not validate it.
  */
 const SIMD_PROBE = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]);
+/**
+ * A module exporting f64x2/f32x4 relaxed_madd and relaxed_nmadd: engines
+ * without Relaxed-SIMD do not validate it, and engines without hardware FMA
+ * fail the exact single-rounded FMA check.
+ */
+const RELAXED_FMA_PROBE = new Uint8Array([
+	0, 97, 115, 109, 1, 0, 0, 0,
+	1, 15, 2, 96, 3, 124, 124, 124, 1, 124, 96, 3, 125, 125, 125, 1, 125,
+	3, 5, 4, 0, 0, 1, 1,
+	7, 19, 4, 1, 100, 0, 0, 2, 100, 110, 0, 1, 1, 115, 0, 2, 2, 115, 110, 0, 3,
+	10, 85, 4,
+	20, 0, 32, 0, 253, 20, 32, 1, 253, 20, 32, 2, 253, 20, 253, 135, 2, 253, 33, 0, 11,
+	20, 0, 32, 0, 253, 20, 32, 1, 253, 20, 32, 2, 253, 20, 253, 136, 2, 253, 33, 0, 11,
+	20, 0, 32, 0, 253, 19, 32, 1, 253, 19, 32, 2, 253, 19, 253, 133, 2, 253, 31, 0, 11,
+	20, 0, 32, 0, 253, 19, 32, 1, 253, 19, 32, 2, 253, 19, 253, 134, 2, 253, 31, 0, 11,
+]);
 /** Whether this engine compiles fixed-width SIMD (cap bit 5). */
 export function jitSimd(): boolean {
 	try {
 		return WebAssembly.validate(SIMD_PROBE);
+	} catch {
+		return false;
+	}
+}
+/** Whether this engine compiles Relaxed-SIMD FMA and executes true single-rounded FMA (cap bit 6). */
+export function jitRelaxedFma(): boolean {
+	try {
+		if (!WebAssembly.validate(RELAXED_FMA_PROBE)) return false;
+		const ex = new WebAssembly.Instance(new WebAssembly.Module(RELAXED_FMA_PROBE)).exports as {
+			d: (a: number, b: number, c: number) => number;
+			dn: (a: number, b: number, c: number) => number;
+			s: (a: number, b: number, c: number) => number;
+			sn: (a: number, b: number, c: number) => number;
+		};
+		const a64 = 1 + 2 ** -52, c64 = -1 - 2 ** -51, e64 = 2 ** -104;
+		const a32 = Math.fround(1 + 2 ** -23), c32 = Math.fround(-1 - 2 ** -22), e32 = Math.fround(2 ** -46);
+		return ex.d(a64, a64, c64) === e64 &&
+			ex.dn(a64, a64, -c64) === -e64 &&
+			ex.s(a32, a32, c32) === e32 &&
+			ex.sn(a32, a32, -c32) === -e32;
 	} catch {
 		return false;
 	}
@@ -225,6 +265,8 @@ export class JitHost {
 	#cpuOfBuf: ((buf: bigint) => bigint) | undefined;
 	/** The engine compiles SIMD (asked once, at the first kw_host_jit_caps). */
 	#simd: boolean | undefined;
+	/** The engine executes true single-rounded Relaxed-SIMD FMA (asked once). */
+	#relaxedFma: boolean | undefined;
 	#buf: number | undefined;
 
 	constructor(opts: JitHostOptions) {
@@ -305,7 +347,8 @@ export class JitHost {
 		}
 		const shared = typeof SharedArrayBuffer !== "undefined" && this.#opts.memory().buffer instanceof SharedArrayBuffer;
 		this.#simd ??= jitSimd();
-		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32) | (shared ? CAP_SHARED : 0) | CAP_TABLE | (this.#simd ? CAP_SIMD : 0);
+		this.#relaxedFma ??= this.#simd && jitRelaxedFma();
+		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32) | (shared ? CAP_SHARED : 0) | CAP_TABLE | (this.#simd ? CAP_SIMD : 0) | (this.#relaxedFma ? CAP_RELAXED_FMA : 0);
 	}
 
 	compile(ptr: bigint | number, len: bigint | number, slot: number, flags = 0): number {

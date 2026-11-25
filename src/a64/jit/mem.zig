@@ -637,10 +637,10 @@ fn classifyVecOp(v: vec_mod.V) ?Access {
                 .wb_imm = imm,
             };
         },
-        .ld1, .st1 => .{
+        .ld1, .st1, .ldn, .stn => .{
             .kind = .base_imm,
             .base = v.n,
-            .is_write = v.k == .st1,
+            .is_write = v.k == .st1 or v.k == .stn,
             .size = (if (v.q) @as(u8, 16) else 8) * v.sh,
             .wb = v.x == 1,
             .wb_imm = @bitCast(v.imm),

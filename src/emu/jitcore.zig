@@ -94,6 +94,9 @@ pub const cap_table: u32 = 16;
 /// crypto translated inline). A host sets it only after validating a module
 /// with SIMD instructions (V8 on x86-64 needs SSE4.1).
 pub const cap_simd: u32 = 32;
+/// The engine compiles Relaxed-SIMD FMA (`f32x4`/`f64x2.relaxed_{madd,nmadd}`)
+/// and executes them as true single-rounded FMA (probed by the host).
+pub const cap_relaxed_fma: u32 = 64;
 
 /// The host offers env.table (cap_table), so the ISA may translate ops into
 /// calls of kwemu functions (A64: `generic` ops). Set by every CPU's
@@ -101,6 +104,9 @@ pub const cap_simd: u32 = 32;
 pub var table_ok: bool = false;
 /// The host compiles SIMD (cap_simd); set like `table_ok`.
 pub var simd_ok: bool = false;
+/// The host compiles Relaxed-SIMD FMA with true single rounding
+/// (cap_relaxed_fma); set like `table_ok`.
+pub var relaxed_fma_ok: bool = false;
 /// Most blocks in one compiled region (see "regions" below).
 pub const max_members = 16;
 /// A region compiled for a page also takes the blocks of that page that have
@@ -253,6 +259,7 @@ fn askHost(st: *State) void {
     st.caps = kw_host_jit_caps();
     table_ok = st.caps & cap_available != 0 and st.caps & cap_table != 0;
     simd_ok = st.caps & cap_available != 0 and st.caps & cap_simd != 0;
+    relaxed_fma_ok = simd_ok and st.caps & cap_relaxed_fma != 0;
     st.threshold = if (st.caps & cap_available == 0)
         never
     else if (st.caps & cap_eager != 0)
@@ -940,6 +947,8 @@ pub fn Jit(comptime I: type) type {
             table: bool = false,
             /// The engine compiles SIMD (cap_simd).
             simd: bool = false,
+            /// The engine compiles Relaxed-SIMD FMA with true single rounding (cap_relaxed_fma).
+            relaxed_fma: bool = false,
             /// The module's register usage (what its prologue loads), from
             /// before the prologue on.
             use: ?*const Use = null,
@@ -1613,7 +1622,14 @@ pub fn Jit(comptime I: type) type {
             const self_loop = rg == null and full and I.selfLoop(all[all.len - 1], b);
 
             const caps = cpu.priv.jit.caps;
-            var e: Emit = .{ .buf = &cpu.priv.jit.buf, .mem32 = caps & cap_mem32 != 0, .shared = caps & cap_shared != 0, .table = caps & cap_table != 0, .simd = caps & cap_simd != 0 };
+            var e: Emit = .{
+                .buf = &cpu.priv.jit.buf,
+                .mem32 = caps & cap_mem32 != 0,
+                .shared = caps & cap_shared != 0,
+                .table = caps & cap_table != 0,
+                .simd = caps & cap_simd != 0,
+                .relaxed_fma = caps & cap_simd != 0 and caps & cap_relaxed_fma != 0,
+            };
             e.rg = rg;
             // b's per-member state (a region's members set their own).
             I.beginMember(&e, all[0..u]);

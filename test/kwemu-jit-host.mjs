@@ -21,13 +21,47 @@
 // once (what js/core/jit.ts does to have V8 compile it inside the call), and
 // then the export kwemu_test_compile_hook, if the instance has one (the unit
 // tests' stand-in for another CPU acting during a compile).
-export function createJitHost({ available = true, eager = false, mem32 = false, strict = false, table: table_ = true, simd = process.env.KWEMU_JIT_SIMD !== "0" } = {}) {
+// Probe module for Wasm Relaxed-SIMD FMA: exports d (f64x2.relaxed_madd, 0x107),
+// dn (f64x2.relaxed_nmadd, 0x108), s (f32x4.relaxed_madd, 0x105) and sn
+// (f32x4.relaxed_nmadd, 0x106). Only sets cap_relaxed_fma (bit 6) if the module
+// validates AND all four perform true single-rounded FMA (not double-rounded mul+add).
+const RELAXED_FMA_PROBE = new Uint8Array([
+  0, 97, 115, 109, 1, 0, 0, 0,
+  1, 15, 2, 96, 3, 124, 124, 124, 1, 124, 96, 3, 125, 125, 125, 1, 125,
+  3, 5, 4, 0, 0, 1, 1,
+  7, 19, 4, 1, 100, 0, 0, 2, 100, 110, 0, 1, 1, 115, 0, 2, 2, 115, 110, 0, 3,
+  10, 85, 4,
+  20, 0, 32, 0, 253, 20, 32, 1, 253, 20, 32, 2, 253, 20, 253, 135, 2, 253, 33, 0, 11,
+  20, 0, 32, 0, 253, 20, 32, 1, 253, 20, 32, 2, 253, 20, 253, 136, 2, 253, 33, 0, 11,
+  20, 0, 32, 0, 253, 19, 32, 1, 253, 19, 32, 2, 253, 19, 253, 133, 2, 253, 31, 0, 11,
+  20, 0, 32, 0, 253, 19, 32, 1, 253, 19, 32, 2, 253, 19, 253, 134, 2, 253, 31, 0, 11,
+]);
+let relaxedFmaCached;
+export function jitRelaxedFma() {
+  if (relaxedFmaCached !== undefined) return relaxedFmaCached;
+  try {
+    if (!WebAssembly.validate(RELAXED_FMA_PROBE)) return (relaxedFmaCached = false);
+    const ex = new WebAssembly.Instance(new WebAssembly.Module(RELAXED_FMA_PROBE)).exports;
+    const a64 = 1 + 2 ** -52, c64 = -1 - 2 ** -51, e64 = 2 ** -104;
+    const a32 = Math.fround(1 + 2 ** -23), c32 = Math.fround(-1 - 2 ** -22), e32 = Math.fround(2 ** -46);
+    return (relaxedFmaCached =
+      ex.d(a64, a64, c64) === e64 &&
+      ex.dn(a64, a64, -c64) === -e64 &&
+      ex.s(a32, a32, c32) === e32 &&
+      ex.sn(a32, a32, -c32) === -e32);
+  } catch {
+    return (relaxedFmaCached = false);
+  }
+}
+
+export function createJitHost({ available = true, eager = false, mem32 = false, strict = false, table: table_ = true, simd = process.env.KWEMU_JIT_SIMD !== "0", relaxedFma = process.env.KWEMU_JIT_RELAXED_FMA !== "0" } = {}) {
   let mem, table, hook, big = true;
   const saved = new Map();
   const stats = { compiles: 0, frees: 0, failures: 0, bytes: 0, compileNs: 0n, errors: [] };
   const idx = (slot) => (big ? BigInt(slot) : slot);
+  const rfma = simd && relaxedFma && jitRelaxedFma();
   const imports = {
-    kw_host_jit_caps: () => (available ? 1 : 0) | (mem32 ? 2 : 0) | (eager ? 4 : 0) | (table_ ? 16 : 0) | (simd ? 32 : 0),
+    kw_host_jit_caps: () => (available ? 1 : 0) | (mem32 ? 2 : 0) | (eager ? 4 : 0) | (table_ ? 16 : 0) | (simd ? 32 : 0) | (rfma ? 64 : 0),
     kw_host_jit_compile(ptr, len, slot, flags) {
       const t0 = process.hrtime.bigint();
       try {
