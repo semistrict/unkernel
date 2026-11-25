@@ -190,7 +190,7 @@ pub fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bo
 
 /// A load into XZR (`generic` in the tier, ops.xzrLoad) as its load kind,
 /// whose write to XZR mem.zig drops.
-fn xzrLoad(o: Op) ?Op {
+pub fn xzrLoad(o: Op) ?Op {
     const l = O.xzrLoad(@truncate(o.aux()), o.imm) orelse return null;
     return if (mem.supported(l)) l else null;
 }

@@ -65,8 +65,9 @@ hands them back and a block is compiled up to its first one.
 
 i64 locals: 0..3 the parameters (x, cpu, irqp, jl), 4..7 the core's (next
 pc, result code, data address, TLB entry), 8..11 region state, 12 NZCV,
-13..20 `l_t` (scratch of one op, any family), 21..28 `l_alu`, 29..32
-`l_br`, 33..36 `l_mem` (each family's own), 37..68 X0..X30 and SP (slot
+13..20 `l_t` (scratch of one op, any family), 21..24 `l_alu`, 25..33
+`l_mcache` (self-loop page cache), 34..36 `l_mem` (coalesced group host
+addresses), 37..68 X0..X30 and SP (slot
 s: 37 + s), 69 TPIDR_EL0, 70 `l_vtmp`, 71..78 `l_u` (vec.zig scratch).
 Without SIMD the V halves follow as i64 (79..142, slot 36 + j: 79 + j);
 with SIMD a v128 group (79..110 V0..V31, 111..118 `l_q`) and an i32 group

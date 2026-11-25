@@ -40,6 +40,7 @@ const simd_move = @import("../simd_move.zig");
 const opexec = @import("../opexec.zig");
 const jit = @import("emit.zig");
 const cm = @import("common.zig");
+const mem = @import("mem.zig");
 const Use = jit.Use;
 const Emit = jit.Emit;
 const At = jit.At;
@@ -2181,25 +2182,21 @@ fn sigmaV(e: *Emit, l: u32, k: [3]u8, wide: bool) void {
 fn ldst1(e: *Emit, v: V, at: At) void {
     const per: u64 = if (v.q) 16 else 8;
     const load = v.k == .ld1;
-    cm.get(e, v.n);
-    e.set(cm.l_va);
-    e.tlbCheck(at.k, at.pc, if (load) jc.tlb_r_off else jc.tlb_w_off, per * v.sh);
-    if (e.mem32) e.op(W.i64_ext_u);
-    e.set(lu);
+    const a = mem.prepareHost(e, at, v.n, 0, !load, per * v.sh);
     for (0..v.sh) |j| {
         const r: u8 = @intCast((v.d + j) & 31);
-        e.get(lu);
+        e.get(a.local);
         e.addr();
         if (load) {
             e.vop(if (v.q) cm.S.v128_load else cm.S.v128_load64_zero);
             e.uleb(0);
-            e.uleb(per * j);
+            e.uleb(a.off + per * j);
             cm.setV(e, r);
         } else {
             get(e, r);
             e.vop(if (v.q) cm.S.v128_store else cm.S.v128_store64_lane);
             e.uleb(0);
-            e.uleb(per * j);
+            e.uleb(a.off + per * j);
             if (!v.q) e.op(0); // lane
         }
     }
@@ -2380,18 +2377,10 @@ fn ldstN(e: *Emit, v: V, at: At) void {
 fn pairEmit(e: *Emit, v: V, at: At) void {
     const n: u64 = @as(u64, 1) << v.size; // bytes per register (4 << (size - 2))
     const load = v.k == .ldpv;
-    cm.get(e, v.n);
-    if (v.x != 1) {
-        e.k64(v.imm);
-        e.op(W.i64_add);
-    }
-    e.set(cm.l_va);
-    e.tlbCheck(at.k, at.pc, if (load) jc.tlb_r_off else jc.tlb_w_off, 2 * n);
-    if (e.mem32) e.op(W.i64_ext_u);
-    e.set(lu);
+    const a = mem.prepareHost(e, at, v.n, if (v.x != 1) v.imm else 0, !load, 2 * n);
     for (0..2) |j| {
         const r = if (j == 0) v.d else v.m;
-        e.get(lu);
+        e.get(a.local);
         e.addr();
         if (load) {
             e.vop(switch (v.size) {
@@ -2400,7 +2389,7 @@ fn pairEmit(e: *Emit, v: V, at: At) void {
                 else => cm.S.v128_load,
             });
             e.uleb(0);
-            e.uleb(n * j);
+            e.uleb(a.off + n * j);
             cm.setV(e, r);
         } else {
             get(e, r);
@@ -2410,7 +2399,7 @@ fn pairEmit(e: *Emit, v: V, at: At) void {
                 else => cm.S.v128_store,
             });
             e.uleb(0);
-            e.uleb(n * j);
+            e.uleb(a.off + n * j);
             if (v.size != 4) e.op(0);
         }
     }
@@ -2425,15 +2414,13 @@ fn pairEmit(e: *Emit, v: V, at: At) void {
 /// LD1/ST1 of one lane, LD1R: one access of 1 << size bytes.
 fn ldstSingle(e: *Emit, v: V, at: At) void {
     const n: u64 = @as(u64, 1) << v.size;
-    cm.get(e, v.n);
-    e.set(cm.l_va);
-    e.tlbCheck(at.k, at.pc, if (v.k == .st1s) jc.tlb_w_off else jc.tlb_r_off, n);
+    const off = mem.prepareAddr(e, at, v.n, 0, v.k == .st1s, n);
     switch (v.k) {
         .ld1s => {
             get(e, v.d);
             e.vop(@as(u32, 0x54) + v.size); // v128.load{8,16,32,64}_lane
             e.uleb(0);
-            e.uleb(0);
+            e.uleb(off);
             e.op(v.idx[0]);
             cm.setV(e, v.d);
         },
@@ -2441,13 +2428,13 @@ fn ldstSingle(e: *Emit, v: V, at: At) void {
             get(e, v.d);
             e.vop(@as(u32, 0x58) + v.size); // v128.store{8,16,32,64}_lane
             e.uleb(0);
-            e.uleb(0);
+            e.uleb(off);
             e.op(v.idx[0]);
         },
         else => {
             e.vop(@as(u32, 0x07) + v.size); // v128.load{8,16,32,64}_splat
             e.uleb(0);
-            e.uleb(0);
+            e.uleb(off);
             cm.setVq(e, v.d, v.q);
         },
     }
