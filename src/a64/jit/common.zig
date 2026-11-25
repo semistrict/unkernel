@@ -311,6 +311,10 @@ pub const S = struct {
     pub const i32x4_trunc_sat_f32x4_u = 0xf9;
     pub const f32x4_convert_i32x4_s = 0xfa;
     pub const f32x4_convert_i32x4_u = 0xfb;
+    pub const f32x4_relaxed_madd = 0x105;
+    pub const f32x4_relaxed_nmadd = 0x106;
+    pub const f64x2_relaxed_madd = 0x107;
+    pub const f64x2_relaxed_nmadd = 0x108;
 };
 
 /// Use bit of an X/SP slot (0..31); none for XZR (slot 32) and other slots.

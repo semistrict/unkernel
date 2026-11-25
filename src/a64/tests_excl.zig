@@ -402,7 +402,7 @@ test "a64 system: ID registers, read-only registers, FPCR/FPSR masks" {
     try t.expectEqual(@as(u64, 6), m.regs.x[6]);
     try t.expectEqual(@as(u64, 0), m.regs.x[7]);
     try t.expectEqual(@as(u64, 0), m.regs.x[8]);
-    try t.expectEqual(@as(u64, 0x07c0_0000), m.regs.x[10]); // AHP, DN, FZ, RMode
+    try t.expectEqual(@as(u64, c.FPCR_MASK), m.regs.x[10]); // AHP, DN, FZ, RMode, WASM_FP
     try t.expectEqual(@as(u64, 0x0800_009f), m.regs.x[11]); // QC, IDC, IXC..IOC
     try t.expectEqual(@as(u64, 0xf000_0000), m.regs.x[12]);
     try t.expectEqual(@as(u64, 0), m.regs.x[13]);

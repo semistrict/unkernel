@@ -447,6 +447,10 @@ pub inline fn barrier(s: St) void {
 // up to the smallest normal); FPCR.FZ (flush denormals, IDC) and FPCR.AHP
 // are not modelled by fpu.
 
+/// Opt-in Wasm-FP / no-FPSR mode bit (reserved/RAZ in ARMv8.0): when set
+/// with RMode = RNE (0) and FZ = 0, FP instructions skip FPSR updates and
+/// compiled code executes bare Wasm FP instructions directly.
+pub const FPCR_WASM_FP: u32 = 1 << 16;
 pub const FPCR_FZ16: u32 = 1 << 19;
 pub const FPCR_RMODE_SHIFT = 22;
 pub const FPCR_FZ: u32 = 1 << 24;
@@ -454,8 +458,14 @@ pub const FPCR_DN: u32 = 1 << 25;
 pub const FPCR_AHP: u32 = 1 << 26;
 /// FPCR bits that exist in ARMv8.0 without trapping support (the trap
 /// enables IOE..IXE, IDE read as zero: they are not implemented; FZ16 is
-/// FEAT_FP16, Len and Stride AArch32 only: RES0).
-pub const FPCR_MASK: u32 = FPCR_AHP | FPCR_DN | FPCR_FZ | (3 << FPCR_RMODE_SHIFT);
+/// FEAT_FP16, Len and Stride AArch32 only: RES0), plus FPCR_WASM_FP.
+pub const FPCR_MASK: u32 = FPCR_AHP | FPCR_DN | FPCR_FZ | (3 << FPCR_RMODE_SHIFT) | FPCR_WASM_FP;
+pub const FPCR_WASM_MASK: u32 = FPCR_FZ | (3 << FPCR_RMODE_SHIFT) | FPCR_WASM_FP;
+
+/// Whether FPCR selects opt-in Wasm-FP / no-FPSR mode (RNE, FZ = 0, bit 16 set).
+pub inline fn wasmFpMode(fpcr: u32) bool {
+    return fpcr & FPCR_WASM_MASK == FPCR_WASM_FP;
+}
 
 pub const FPSR_IOC: u32 = 1 << 0;
 pub const FPSR_DZC: u32 = 1 << 1;
@@ -489,7 +499,7 @@ pub fn fpsrBits(fl: u32) u32 {
 /// Accumulate fpu flags into FPSR (call once per instruction, after the
 /// last thing that can fault).
 pub inline fn fpRaise(s: St, fl: u32) void {
-    s.r.fpsr |= fpsrBits(fl);
+    if (!wasmFpMode(s.r.fpcr)) s.r.fpsr |= fpsrBits(fl);
 }
 
 /// FPProcessNaN: the quieted NaN `a` (raises NV for a signalling one), or
