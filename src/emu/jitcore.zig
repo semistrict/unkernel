@@ -1124,11 +1124,11 @@ pub fn Jit(comptime I: type) type {
             }
 
             /// Inline data-TLB lookup for an access of `size` bytes at the
-            /// address in local `I.l_va`: leaves the host address on the stack
-            /// (as a memory operand), or hands op k (at pc) back on a miss
-            /// (same test as Cpu.load/storeChk: tag == vpn of the last byte).
-            /// `tlb_off`: tlb_r_off or tlb_w_off.
-            pub fn tlbCheck(e: *Emit, k: usize, pc: u64, tlb_off: u64, size: u64) void {
+            /// address in local `I.l_va`: leaves the 64-bit host address on
+            /// the stack (before `e.addr()`), or hands op k (at pc) back on a
+            /// miss (same test as Cpu.load/storeChk: tag == vpn of the last
+            /// byte). `tlb_off`: tlb_r_off or tlb_w_off.
+            pub fn tlbCheck64(e: *Emit, k: usize, pc: u64, tlb_off: u64, size: u64) void {
                 e.get(l_cpu);
                 e.get(I.l_va);
                 e.k64(8);
@@ -1155,7 +1155,64 @@ pub fn Jit(comptime I: type) type {
                 e.mem(W.i64_load, 3, tlb_off + 8); // add
                 e.get(I.l_va);
                 e.op(W.i64_add);
+            }
+
+            /// Inline data-TLB lookup leaving the host address as a memory
+            /// operand on the stack.
+            pub fn tlbCheck(e: *Emit, k: usize, pc: u64, tlb_off: u64, size: u64) void {
+                e.tlbCheck64(k, pc, tlb_off, size);
                 e.addr();
+            }
+
+            /// Cached data-TLB lookup for standalone self-loops: locals start
+            /// at 0 (`l_lim == 0` forces a fill on the first pass). On a hit
+            /// (`(l_va -% l_page) <_u l_lim`), avoids loading from `cpu.tlb_*`
+            /// completely; on a miss, checks the data TLB (handing back on
+            /// miss) and refills `(l_page, l_add, l_lim)`. Leaves the 64-bit
+            /// host address on the stack.
+            pub fn tlbCheckCached64(e: *Emit, k: usize, pc: u64, tlb_off: u64, size: u64, l_page: u32, l_add: u32, l_lim: u32) void {
+                std.debug.assert(size >= 1 and size <= 4096);
+                e.get(I.l_va);
+                e.get(l_page);
+                e.op(W.i64_sub);
+                e.get(l_lim);
+                e.op(W.i64_ge_u);
+                e.open(W.@"if", W.void_t);
+                e.get(l_cpu);
+                e.get(I.l_va);
+                e.k64(8);
+                e.op(W.i64_shr_u);
+                e.k64(dtlb_mask);
+                e.op(W.i64_and);
+                e.op(W.i64_add);
+                e.tee(I.l_e);
+                e.addr();
+                e.mem(W.i64_load, 3, tlb_off); // tag
+                e.get(I.l_va);
+                if (size > 1) {
+                    e.k64(size - 1);
+                    e.op(W.i64_add);
+                }
+                e.k64(12);
+                e.op(W.i64_shr_u);
+                e.op(W.i64_ne);
+                e.open(W.@"if", W.void_t);
+                e.handBack(k, pc);
+                e.close();
+                e.get(I.l_e);
+                e.addr();
+                e.mem(W.i64_load, 3, tlb_off + 8); // add
+                e.set(l_add);
+                e.get(I.l_va);
+                e.k64(~@as(u64, 4095));
+                e.op(W.i64_and);
+                e.set(l_page);
+                e.k64(4097 - size);
+                e.set(l_lim);
+                e.close();
+                e.get(I.l_va);
+                e.get(l_add);
+                e.op(W.i64_add);
             }
 
             /// Self-loop back edge: stop (pc = block start, done) when `I.poll`
