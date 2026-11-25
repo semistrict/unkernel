@@ -9,6 +9,7 @@
 //! This file is complete: adding instructions never needs a change here.
 
 const c = @import("common.zig");
+const fatwasm = @import("../emu/fatwasm.zig");
 const dp_imm = @import("dp_imm.zig");
 const branch = @import("branch.zig");
 const ldst = @import("ldst.zig");
@@ -92,7 +93,7 @@ fn routeSimdFp(inst: u32) Group {
 /// Execute one fetched instruction at s.r.pc.
 pub fn exec(s: c.St, inst: u32) c.Error!c.Exit {
     const e = switch (route(inst)) {
-        .unallocated => return c.ill(s, inst),
+        .unallocated => if (inst & fatwasm.opcode_mask == fatwasm.opcode_base) try fatwasm.exec(s, inst) else return c.ill(s, inst),
         .paravirt => try paravirt.exec(s, inst),
         .dp_imm => try dp_imm.exec(s, inst),
         .branch => try branch.exec(s, inst),

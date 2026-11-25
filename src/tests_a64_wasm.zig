@@ -17,4 +17,5 @@ test {
     _ = jit_tests;
     _ = @import("a64/paravirt.zig");
     _ = @import("emu/kwemu.zig"); // kw_debug_cpu_of_jit_buf
+    _ = @import("emu/fatwasm.zig");
 }

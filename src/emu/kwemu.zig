@@ -885,6 +885,56 @@ pub const Cpu = extern struct {
         }
     }
 
+    inline fn translatePage(self: *Cpu, pg: u64, access: core.Access) core.Error!u64 {
+        const vpn = pg >> page_shift;
+        const i: usize = @intCast(vpn & (dtlb_n - 1));
+        switch (access) {
+            .read => {
+                const e = &self.priv.tlb_r[i];
+                if (e.tag == vpn) return pg +% e.add;
+                return try self.translate(pg, .read);
+            },
+            .write => {
+                const e = &self.priv.tlb_w[i];
+                if (e.tag == vpn or e.tag == vpn | code_flag) return pg +% e.add;
+                return try self.translate(pg, .write);
+            },
+            .exec => unreachable,
+        }
+    }
+
+    /// Translate guest virtual buffer `[va, va + len)` to a single contiguous
+    /// host linear-memory address, respecting Sv48 permissions, A/D bits
+    /// (demand-faulting via `error.PageFault`), and SMC code tracking.
+    /// Returns `null` if the range overflows, is not physically contiguous in
+    /// host memory, or (when `write` is true) touches a page holding decoded
+    /// code.
+    pub fn translateContig(self: *Cpu, va: u64, len: u64, write: bool) core.Error!?u64 {
+        if (len == 0) return 0;
+        const end = std.math.add(u64, va, len - 1) catch return null;
+        const first_pg = va & ~page_mask;
+        const last_pg = end & ~page_mask;
+        const access: core.Access = if (write) .write else .read;
+
+        var base_host_pg: u64 = 0;
+        var expected_host_pg: u64 = 0;
+        var pg = first_pg;
+        while (true) {
+            const host_pg = try self.translatePage(pg, access);
+            if (write and self.isMarked(host_pg)) return null;
+            if (pg == first_pg) {
+                base_host_pg = host_pg;
+                expected_host_pg = host_pg;
+            } else {
+                expected_host_pg +%= page_size;
+                if (host_pg != expected_host_pg) return null;
+            }
+            if (pg == last_pg) break;
+            pg += page_size;
+        }
+        return base_host_pg +% (va & page_mask);
+    }
+
     // ---- block lookup / decode --------------------------------------------------
     //
     // The cache machinery (block table, generations, revalidation, code-page

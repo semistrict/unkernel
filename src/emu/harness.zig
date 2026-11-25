@@ -45,6 +45,9 @@ pub const Options = struct {
 
 /// Not in the ABI: the A64 reference loop (src/a64/run.zig).
 extern fn kw_debug_run_ref(cpu: *kw.struct_kw_cpu, regs: *kw.struct_kw_regs) u32;
+/// Not in the ABI: Fat ELF `.kw.wasm` registration helpers (src/emu/fatwasm.zig).
+extern fn kw_fat_reset() void;
+extern fn kw_fat_register(id: u32, flags: u32, ptr: [*]const u8, len: usize) i32;
 const kw_options = @import("kwemu_options");
 /// -Dkwemu-stats only: kwemu.Stats (11 counters, then executed ops per
 /// kind; more after them that the harness does not read).
@@ -352,6 +355,68 @@ pub const Machine = struct {
         }
         m.regs.pc = entry0 + bias;
         m.regs.sp = sp;
+
+        // Optional Fat ELF `.kw.wasm` section: precompiled Wasm modules
+        // registered into kwemu's fatwasm table (no-op on native / non-JIT).
+        kw_fat_reset();
+        m.loadFatWasm(image);
+    }
+
+    fn loadFatWasm(m: *Machine, image: []const u8) void {
+        const rd = struct {
+            fn f(comptime T: type, b: []const u8, off: u64) T {
+                return std.mem.readInt(T, b[@intCast(off)..][0..@sizeOf(T)], .little);
+            }
+        }.f;
+        const shoff = rd(u64, image, 40);
+        const shentsize: u64 = rd(u16, image, 58);
+        const shnum: u64 = rd(u16, image, 60);
+        const shstrndx: u64 = rd(u16, image, 62);
+        if (shoff == 0 or shnum == 0 or shentsize < 64 or shstrndx >= shnum) return;
+        const sh_total = std.math.mul(u64, shnum, shentsize) catch return;
+        const sh_end = std.math.add(u64, shoff, sh_total) catch return;
+        if (sh_end > image.len) return;
+
+        const str_hdr = shoff + shstrndx * shentsize;
+        const str_off = rd(u64, image, str_hdr + 24);
+        const str_sz = rd(u64, image, str_hdr + 32);
+        const str_end = std.math.add(u64, str_off, str_sz) catch return;
+        if (str_end > image.len) return;
+        const shstrtab = image[@intCast(str_off)..@intCast(str_end)];
+
+        for (0..@intCast(shnum)) |i| {
+            const sh = shoff + @as(u64, i) * shentsize;
+            const name_off: usize = rd(u32, image, sh);
+            if (name_off >= shstrtab.len) continue;
+            const tail = shstrtab[name_off..];
+            const nul = std.mem.indexOfScalar(u8, tail, 0) orelse tail.len;
+            if (!std.mem.eql(u8, tail[0..nul], ".kw.wasm")) continue;
+
+            const sec_off = rd(u64, image, sh + 24);
+            const sec_sz = rd(u64, image, sh + 32);
+            const sec_end = std.math.add(u64, sec_off, sec_sz) catch return;
+            if (sec_end > image.len or sec_sz < 16) return;
+            const sec = image[@intCast(sec_off)..@intCast(sec_end)];
+            if (!std.mem.eql(u8, sec[0..8], "KWWASM\x00\x00")) return;
+            const ver = rd(u32, sec, 8);
+            const count = rd(u32, sec, 12);
+            if (ver != 1 or count == 0 or count > 16) return;
+            const table_end: u64 = 16 + @as(u64, count) * 16;
+            if (table_end > sec.len) return;
+            var loaded: u32 = 0;
+            for (0..count) |e| {
+                const eo: u64 = 16 + @as(u64, e) * 16;
+                const fn_id = rd(u32, sec, eo);
+                const flags = rd(u32, sec, eo + 4);
+                const off = rd(u32, sec, eo + 8);
+                const len = rd(u32, sec, eo + 12);
+                const mod_end = std.math.add(u64, off, len) catch continue;
+                if (fn_id >= 16 or len == 0 or mod_end > sec.len) continue;
+                if (kw_fat_register(fn_id, flags, sec.ptr + off, len) == 0) loaded += 1;
+            }
+            if (m.opt.verbose) m.print("[harness] .kw.wasm: registered {d}/{d} modules\n", .{ loaded, count });
+            return;
+        }
     }
 
     fn pc(m: *const Machine) u64 {
