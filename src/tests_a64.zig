@@ -11,4 +11,6 @@ test {
     _ = @import("a64/tier_tests.zig");
     _ = @import("a64/jit/emit.zig");
     _ = @import("a64/jit/tests.zig");
+    _ = @import("a64/paravirt.zig");
+    _ = @import("emu/fatwasm.zig");
 }

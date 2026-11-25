@@ -9,6 +9,7 @@
 //! This file is complete: adding instructions never needs a change here.
 
 const c = @import("common.zig");
+const fatwasm = @import("../emu/fatwasm.zig");
 const dp_imm = @import("dp_imm.zig");
 const branch = @import("branch.zig");
 const ldst = @import("ldst.zig");
@@ -18,11 +19,13 @@ const fp = @import("fp.zig");
 const simd_move = @import("simd_move.zig");
 const simd_arith = @import("simd_arith.zig");
 const crypto = @import("crypto.zig");
+const paravirt = @import("paravirt.zig");
 
 /// The file an encoding belongs to. `unallocated`: reserved, SME, SVE and
 /// unallocated top-level space (always ILLEGAL here).
 pub const Group = enum {
     unallocated,
+    paravirt,
     dp_imm,
     branch,
     ldst,
@@ -37,8 +40,10 @@ pub const Group = enum {
 pub fn route(inst: u32) Group {
     const op0 = c.bits(inst, 28, 25);
     return switch (op0) {
-        // 0000 reserved (UDF) / SME, 0001 unallocated, 0010 SVE, 0011 unallocated
-        0b0000, 0b0001, 0b0010, 0b0011 => .unallocated,
+        // 0000 reserved (UDF) / SME (0x0000_ff00..0x0000_ff0f: paravirt),
+        // 0001 unallocated, 0010 SVE, 0011 unallocated
+        0b0000 => if (paravirt.isParavirt(inst)) .paravirt else .unallocated,
+        0b0001, 0b0010, 0b0011 => .unallocated,
         0b1000, 0b1001 => .dp_imm,
         0b1010, 0b1011 => .branch,
         0b0100, 0b0110, 0b1100, 0b1110 => routeLdSt(inst),
@@ -88,7 +93,8 @@ fn routeSimdFp(inst: u32) Group {
 /// Execute one fetched instruction at s.r.pc.
 pub fn exec(s: c.St, inst: u32) c.Error!c.Exit {
     const e = switch (route(inst)) {
-        .unallocated => return c.ill(s, inst),
+        .unallocated => if (inst & fatwasm.opcode_mask == fatwasm.opcode_base) try fatwasm.exec(s, inst) else return c.ill(s, inst),
+        .paravirt => try paravirt.exec(s, inst),
         .dp_imm => try dp_imm.exec(s, inst),
         .branch => try branch.exec(s, inst),
         .ldst => try ldst.exec(s, inst),

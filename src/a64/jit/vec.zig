@@ -40,6 +40,7 @@ const simd_move = @import("../simd_move.zig");
 const opexec = @import("../opexec.zig");
 const jit = @import("emit.zig");
 const cm = @import("common.zig");
+const mem = @import("mem.zig");
 const Use = jit.Use;
 const Emit = jit.Emit;
 const At = jit.At;
@@ -102,6 +103,9 @@ pub const Kind = enum(u8) {
     /// post-index by imm, 2: by Xm
     ld1,
     st1,
+    /// LD2-LD4, ST2-ST4 (multiple structures, sh = selem in 2..4); x as for ld1
+    ldn,
+    stn,
     /// LD1, ST1 (single structure: lane `idx[0]` of Vt, 1 << size bytes),
     /// LD1R (Q: both halves); x as for ld1
     ld1s,
@@ -137,7 +141,7 @@ pub const Kind = enum(u8) {
     fp_bin,
     /// FP min/max (FMAX, FMIN, FMAXNM, FMINNM): size 2 S, 3 D
     fp_minmax,
-    /// FMLA (x 0), FMLS (x 1) (vector & by-element, S lanes only)
+    /// FMLA (x 0), FMLS (x 1) (vector & by-element, S and D lanes)
     fp_mla,
     /// FSQRT (vector): size 2 S, 3 D
     fp_sqrt,
@@ -308,8 +312,7 @@ fn byElem(raw: u32) ?V {
                 v.x = 2;
                 v.code = if (dbl) cm.S.f64x2_mul else cm.S.f32x4_mul;
             },
-            0b0001, 0b0101 => { // FMLA, FMLS by element (single only)
-                if (dbl) return null;
+            0b0001, 0b0101 => { // FMLA, FMLS by element (S and D lanes)
                 v.k = .fp_mla;
                 v.x = @intFromBool(opcode == 0b0101);
             },
@@ -450,7 +453,6 @@ fn threeSameFp(raw: u32) ?V {
             v.code = if (a) (if (dbl) cm.S.f64x2_min else cm.S.f32x4_min) else (if (dbl) cm.S.f64x2_max else cm.S.f32x4_max);
         },
         0b0_0_11001, 0b0_1_11001 => {
-            if (dbl) return null;
             v.k = .fp_mla;
             v.x = @intFromBool(a);
         },
@@ -889,14 +891,20 @@ fn ldst(raw: u32) ?V {
     if (bit(raw, 24)) return single(raw);
     const post = bit(raw, 23);
     if (if (post) bit(raw, 21) else bits(raw, 21, 16) != 0) return null;
-    const nregs: u8 = switch (bits(raw, 15, 12)) {
-        0b0111 => 1,
-        0b1010 => 2,
-        0b0110 => 3,
-        0b0010 => 4,
-        else => return null, // LD2-LD4, ST2-ST4: calls
+    const load = bit(raw, 22);
+    const nregs: u8, const interleave: bool = switch (bits(raw, 15, 12)) {
+        0b0111 => .{ 1, false },
+        0b1010 => .{ 2, false },
+        0b0110 => .{ 3, false },
+        0b0010 => .{ 4, false },
+        0b1000 => .{ 2, true },
+        0b0100 => .{ 3, true },
+        0b0000 => .{ 4, true },
+        else => return null,
     };
-    var v = regs3(raw, if (bit(raw, 22)) .ld1 else .st1);
+    var v = regs3(raw, if (interleave) (if (load) .ldn else .stn) else (if (load) .ld1 else .st1));
+    v.size = @intCast(bits(raw, 11, 10));
+    if (interleave and v.size == 3 and !v.q) return null; // LD2-4/ST2-4 .1d is illegal
     v.sh = nregs;
     if (post) {
         if (v.m == 31) {
@@ -1061,11 +1069,11 @@ pub fn usage(v: V) Use {
             if (v.x == 1 or v.x == 3) u = u.with(cm.wr(v.n));
             break :blk u.with(if (v.k == .ldpv) vw(v.d).with(vw(v.m)) else vr(v.d).with(vr(v.m)));
         },
-        .ld1, .st1, .ld1s, .st1s, .ld1r => blk: {
+        .ld1, .st1, .ldn, .stn, .ld1s, .st1s, .ld1r => blk: {
             var u = cm.rd(v.n); // Rn = 31 is SP (slot 31)
             if (v.x != 0) u = u.with(cm.wr(v.n));
             if (v.x == 2) u = u.with(cm.rd(v.m));
-            for (0..v.sh) |j| u = u.with(if (v.k == .ld1 or v.k == .ld1r) vw(v.d + @as(u8, @intCast(j))) else vr(v.d + @as(u8, @intCast(j))));
+            for (0..v.sh) |j| u = u.with(if (v.k == .ld1 or v.k == .ldn or v.k == .ld1r) vw(v.d + @as(u8, @intCast(j))) else vr(v.d + @as(u8, @intCast(j))));
             if (v.k == .ld1s) u = u.with(vr(v.d)).with(vw(v.d));
             break :blk u;
         },
@@ -1403,6 +1411,7 @@ pub fn emit(e: *Emit, v: V, at: At) void {
             cm.setV(e, v.d);
         },
         .ld1, .st1 => ldst1(e, v, at),
+        .ldn, .stn => ldstN(e, v, at),
         .ld1s, .st1s, .ld1r => ldstSingle(e, v, at),
         .ldpv, .stpv => pairEmit(e, v, at),
         .aese, .aesd => {
@@ -1542,33 +1551,67 @@ pub fn emit(e: *Emit, v: V, at: At) void {
 // ---- AdvSIMD FP fast paths --------------------------------------------------------
 
 const fpcr_off = cm.off(ops.nzcv_slot) + 4;
-const fpsr_off = fpcr_off + 4;
-const fpcr_fast_mask: i32 = @bitCast(c.FPCR_FZ | (3 << c.FPCR_RMODE_SHIFT));
+const fpcr_fast_mask: u64 = c.FPCR_FZ | (3 << c.FPCR_RMODE_SHIFT);
+const fpcr_wasm_mask: u64 = c.FPCR_WASM_MASK;
 
-fn fpcrFast(e: *Emit) void {
+fn loadWasmFp(e: *Emit, save: u32) void {
     e.get(jc.l_x);
     e.addr();
-    e.mem(W.i32_load, 2, fpcr_off);
-    e.k32(fpcr_fast_mask);
-    e.op(W.i32_and);
-    e.op(W.i32_eqz);
+    e.mem(W.i64_load, 2, fpcr_off);
+    e.tee(save);
+    e.k64(fpcr_wasm_mask);
+    e.op(W.i64_and);
+    e.k64(c.FPCR_WASM_FP);
+    e.op(W.i64_eq);
 }
-fn fzClear(e: *Emit) void {
-    e.get(jc.l_x);
-    e.addr();
-    e.mem(W.i32_load, 2, fpcr_off);
-    e.k32(@bitCast(c.FPCR_FZ));
-    e.op(W.i32_and);
-    e.op(W.i32_eqz);
+fn fastIxcFrom(e: *Emit, l: u32) void {
+    const ixc: u64 = @as(u64, c.FPSR_IXC) << 32;
+    e.get(l);
+    e.k64(fpcr_fast_mask | ixc);
+    e.op(W.i64_and);
+    e.k64(ixc);
+    e.op(W.i64_eq);
 }
-fn ixcSet(e: *Emit) void {
-    e.get(jc.l_x);
-    e.addr();
-    e.mem(W.i32_load, 2, fpsr_off);
-    e.k32(@ctz(c.FPSR_IXC));
-    e.op(W.i32_shr_u);
-    e.k32(1);
-    e.op(W.i32_and);
+fn fzClearFrom(e: *Emit, l: u32) void {
+    e.get(l);
+    e.k64(c.FPCR_FZ);
+    e.op(W.i64_and);
+    e.op(W.i64_eqz);
+}
+fn fzClearIxcFrom(e: *Emit, l: u32) void {
+    const ixc: u64 = @as(u64, c.FPSR_IXC) << 32;
+    e.get(l);
+    e.k64(@as(u64, c.FPCR_FZ) | ixc);
+    e.op(W.i64_and);
+    e.k64(ixc);
+    e.op(W.i64_eq);
+}
+/// Push the i32 "FPCR allows the fast path and both FPSR.IXC and FPSR.UFC are set"
+/// from FPCR and FPSR as `loadWasmFp` saved them in `lt`.
+fn fastIxcUfc(e: *Emit) void {
+    const flags: u64 = @as(u64, c.FPSR_IXC | c.FPSR_UFC) << 32;
+    e.get(lt);
+    e.k64(fpcr_fast_mask | flags);
+    e.op(W.i64_and);
+    e.k64(flags);
+    e.op(W.i64_eq);
+}
+fn finiteMask(e: *Emit, l: u32, dbl: bool) void {
+    if (dbl) {
+        e.get(l);
+        e.k32(1);
+        e.vop(cm.S.i64x2_shl);
+        e.k32(53);
+        e.vop(cm.S.i64x2_shr_u);
+        k64x2(e, 2047);
+        e.vop(cm.S.i64x2_lt_s);
+    } else {
+        e.get(l);
+        e.k32(1);
+        e.vop(cm.S.i32x4_shl);
+        k32x4(e, 0xff00_0000);
+        e.vop(cm.S.i32x4_lt_u);
+    }
 }
 
 /// Slow path for AdvSIMD FP: flush only the V registers `v` reads, run the
@@ -1637,6 +1680,13 @@ fn isZeroMask(e: *Emit, l: u32, dbl: bool) void {
 
 fn emitFpBin(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    getM(e, v);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const a_loc = lq;
     const b_loc = lq + 1;
     const r_loc = lq + 2;
@@ -1661,9 +1711,15 @@ fn emitFpBin(e: *Emit, v: V, at: At) void {
     }
     e.vop(v128_or);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fpcrFast(e);
+    fastIxcFrom(e, lt);
     e.op(W.i32_and);
-    ixcSet(e);
+    e.open(W.@"if", W.void_t);
+    e.get(r_loc);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
+    fastIxcUfc(e);
+    finiteMask(e, r_loc, dbl);
+    e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(r_loc);
@@ -1671,10 +1727,18 @@ fn emitFpBin(e: *Emit, v: V, at: At) void {
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
+    e.close();
+    e.close();
 }
 
 fn emitFpSqrt(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const r_loc = lq + 1;
     normOp(e, v, false, 0x4080_0000);
     vop(e, v.code);
@@ -1683,9 +1747,15 @@ fn emitFpSqrt(e: *Emit, v: V, at: At) void {
     isZeroMask(e, r_loc, dbl);
     e.vop(v128_or);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fpcrFast(e);
+    fastIxcFrom(e, lt);
     e.op(W.i32_and);
-    ixcSet(e);
+    e.open(W.@"if", W.void_t);
+    e.get(r_loc);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
+    fastIxcUfc(e);
+    finiteMask(e, r_loc, dbl);
+    e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(r_loc);
@@ -1693,10 +1763,19 @@ fn emitFpSqrt(e: *Emit, v: V, at: At) void {
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
+    e.close();
+    e.close();
 }
 
 fn emitFpMinmax(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    getM(e, v);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const r_loc = lq;
     normOp(e, v, false, 0x4080_0000);
     normOp(e, v, true, 0x3f80_0000);
@@ -1706,7 +1785,7 @@ fn emitFpMinmax(e: *Emit, v: V, at: At) void {
     e.get(r_loc);
     e.vop(if (dbl) cm.S.f64x2_eq else cm.S.f32x4_eq);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fzClear(e);
+    fzClearFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(r_loc);
@@ -1714,10 +1793,18 @@ fn emitFpMinmax(e: *Emit, v: V, at: At) void {
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
+    e.close();
 }
 
 fn emitFpCmp(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    getM(e, v);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const eq: u32 = if (dbl) cm.S.f64x2_eq else cm.S.f32x4_eq;
     const a_loc = lq;
     const b_loc = lq + 1;
@@ -1733,7 +1820,7 @@ fn emitFpCmp(e: *Emit, v: V, at: At) void {
     e.vop(eq);
     e.vop(v128_and);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fzClear(e);
+    fzClearFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(a_loc);
@@ -1743,10 +1830,18 @@ fn emitFpCmp(e: *Emit, v: V, at: At) void {
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
+    e.close();
 }
 
 fn emitFpCmp0(e: *Emit, v: V, at: At) void {
     const dbl = v.size == 3;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    k128(e, 0, 0);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const eq: u32 = if (dbl) cm.S.f64x2_eq else cm.S.f32x4_eq;
     const a_loc = lq;
     normOp(e, v, false, 0x4080_0000);
@@ -1755,7 +1850,7 @@ fn emitFpCmp0(e: *Emit, v: V, at: At) void {
     e.get(a_loc);
     e.vop(eq);
     e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
-    fzClear(e);
+    fzClearFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(a_loc);
@@ -1764,6 +1859,7 @@ fn emitFpCmp0(e: *Emit, v: V, at: At) void {
     cm.setVq(e, v.d, v.q);
     e.op(W.@"else");
     vecFpSlow(e, v, at);
+    e.close();
     e.close();
 }
 
@@ -1811,45 +1907,328 @@ fn emitMlaPair(e: *Emit, l_a: u32, l_b: u32, l_d: u32, hi: bool, sub: bool, s_lo
     e.vop(v128_or);
 }
 
-fn emitFpMla(e: *Emit, v: V, at: At) void {
-    const sub = v.x == 1;
-    const m_loc = lq;
-    const s_loc = lq + 1;
-    const r0_loc = lq + 2;
-    const r1_loc = lq + 3;
-    const ok_loc = lq + 4;
-    const a_loc = cm.vloc(v.n & 31);
+/// Subnormal / underflow-safe S-lane FMLA/FMLS path (requires FPCR fast and
+/// FPSR.(IXC|UFC) set): promotes to f64 (exact product), computes TwoSum(d, p),
+/// and accepts whenever exp(s) < 1150 (no f32 overflow/Inf/NaN) and the f64
+/// sum itself was exact (err == 0), so f32_demote is strictly single-rounded.
+/// Uses scratch locals lq+1 (s), lq+5 (d64), lq+6 (p64), lq+7 (bb).
+fn emitMlaSubPair(e: *Emit, l_a: u32, l_b: u32, l_d: u32, hi: bool, sub: bool, r_loc: u32) void {
+    const l_s = lq + 1;
+    const l_d64 = lq + 5;
+    const l_p64 = lq + 6;
+    const l_bb = lq + 7;
+    pushHalfF64(e, l_d, hi);
+    e.tee(l_d64);
+    pushHalfF64(e, l_a, hi);
+    if (sub) e.vop(cm.S.f64x2_neg);
+    pushHalfF64(e, l_b, hi);
+    e.vop(cm.S.f64x2_mul);
+    e.tee(l_p64);
+    e.vop(cm.S.f64x2_add);
+    e.tee(l_s);
+    e.vop(cm.S.f32x4_demote_f64x2_zero);
+    e.set(r_loc);
+    // TwoSum(d64, p64): bb = s - d64; err = (d64 - (s - bb)) + (p64 - bb)
+    e.get(l_s);
+    e.get(l_d64);
+    e.vop(cm.S.f64x2_sub);
+    e.set(l_bb);
+    e.get(l_d64);
+    e.get(l_s);
+    e.get(l_bb);
+    e.vop(cm.S.f64x2_sub);
+    e.vop(cm.S.f64x2_sub);
+    e.get(l_p64);
+    e.get(l_bb);
+    e.vop(cm.S.f64x2_sub);
+    e.vop(cm.S.f64x2_add);
+    k128(e, 0, 0);
+    e.vop(cm.S.f64x2_eq);
+    // exp(s) < 1150 (finite, no f32 overflow/Inf/NaN)
+    e.get(l_s);
+    e.k32(1);
+    e.vop(cm.S.i64x2_shl);
+    e.k32(53);
+    e.vop(cm.S.i64x2_shr_u);
+    k64x2(e, 1150);
+    e.vop(cm.S.i64x2_lt_s);
+    e.vop(v128_and);
+}
+
+fn fmaRange2D(e: *Emit, l: u32, tmp: u32) void {
+    e.get(l);
+    e.k32(1);
+    e.vop(cm.S.i64x2_shl);
+    e.k32(53);
+    e.vop(cm.S.i64x2_shr_u);
+    e.set(tmp);
+    e.get(tmp);
+    k64x2(e, 579);
+    e.vop(cm.S.i64x2_gt_s);
+    e.get(tmp);
+    k64x2(e, 1461);
+    e.vop(cm.S.i64x2_lt_s);
+    e.vop(v128_and);
+}
+
+fn fmaRangeOrZero2D(e: *Emit, l: u32, tmp: u32) void {
+    fmaRange2D(e, l, tmp);
+    isZeroMask(e, l, true);
+    e.vop(v128_or);
+}
+
+fn split2D(e: *Emit, l: u32, hi: u32, lo: u32, tmp: u32) void {
+    e.get(l);
+    k64x2(e, @bitCast(@as(f64, 134217729.0)));
+    e.vop(cm.S.f64x2_mul);
+    e.set(tmp);
+    e.get(tmp);
+    e.get(tmp);
+    e.get(l);
+    e.vop(cm.S.f64x2_sub);
+    e.vop(cm.S.f64x2_sub);
+    e.set(hi);
+    e.get(l);
+    e.get(hi);
+    e.vop(cm.S.f64x2_sub);
+    e.set(lo);
+}
+
+fn twoSum2D(e: *Emit, la: u32, lb: u32, out_s: u32, out_err: u32, tmp_v: u32) void {
+    e.get(la);
+    e.get(lb);
+    e.vop(cm.S.f64x2_add);
+    e.set(out_s);
+    e.get(out_s);
+    e.get(la);
+    e.vop(cm.S.f64x2_sub);
+    e.set(tmp_v);
+    e.get(la);
+    e.get(out_s);
+    e.get(tmp_v);
+    e.vop(cm.S.f64x2_sub);
+    e.vop(cm.S.f64x2_sub);
+    e.get(lb);
+    e.get(tmp_v);
+    e.vop(cm.S.f64x2_sub);
+    e.vop(cm.S.f64x2_add);
+    e.set(out_err);
+}
+
+/// Vector 2D FMLA/FMLS (vector and by-element) via parallel f64x2 Dekker
+/// TwoProd + Knuth TwoSum over bounded exponents (580..1460), bit-exact with
+/// the interpreter; falls back to vecFpSlow on ties, powers of two or out-of-range.
+fn emitFpMla2D(e: *Emit, v: V, at: At) void {
     const d_loc = cm.vloc(v.d & 31);
     getM(e, v);
-    e.set(m_loc);
-    emitMlaPair(e, a_loc, m_loc, d_loc, false, sub, s_loc, r0_loc);
-    if (v.q) {
-        e.set(ok_loc);
-        emitMlaPair(e, a_loc, m_loc, d_loc, true, sub, s_loc, r1_loc);
-        e.get(ok_loc);
-        e.vop(v128_and);
-    }
+    e.set(lq + 0); // b
+    get(e, v.n);
+    if (v.x == 1) e.vop(cm.S.f64x2_neg);
+    e.set(lq + 1); // a (negated for FMLS)
+    e.k64(0);
+    e.set(lu);
+    fmaRangeOrZero2D(e, lq + 1, lq + 2);
+    fmaRangeOrZero2D(e, lq + 0, lq + 2);
+    e.vop(v128_and);
+    fmaRangeOrZero2D(e, d_loc, lq + 2);
+    e.vop(v128_and);
     e.vop(cm.S.i64x2_all_true);
-    fpcrFast(e);
-    e.op(W.i32_and);
-    ixcSet(e);
+    fastIxcFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
-    e.get(r0_loc);
-    if (v.q) {
-        e.get(r1_loc);
-        shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23 });
-    }
+    // Dekker TwoProd(a=lq+1, b=lq+0) -> (p=lq+6, perr=lq+7)
+    split2D(e, lq + 1, lq + 2, lq + 3, lq + 4);
+    split2D(e, lq + 0, lq + 4, lq + 5, lq + 6);
+    e.get(lq + 1);
+    e.get(lq + 0);
+    e.vop(cm.S.f64x2_mul);
+    e.set(lq + 6); // p; lq+0, lq+1 now free
+    e.get(lq + 2);
+    e.get(lq + 4);
+    e.vop(cm.S.f64x2_mul);
+    e.get(lq + 6);
+    e.vop(cm.S.f64x2_sub);
+    e.get(lq + 2);
+    e.get(lq + 5);
+    e.vop(cm.S.f64x2_mul);
+    e.vop(cm.S.f64x2_add);
+    e.get(lq + 3);
+    e.get(lq + 4);
+    e.vop(cm.S.f64x2_mul);
+    e.vop(cm.S.f64x2_add);
+    e.get(lq + 3);
+    e.get(lq + 5);
+    e.vop(cm.S.f64x2_mul);
+    e.vop(cm.S.f64x2_add);
+    e.set(lq + 7); // perr; lq+2..5 now free
+    // Knuth TwoSum chain: s = p + d, esum = serr + perr, r = s + esum
+    twoSum2D(e, lq + 6, d_loc, lq + 0, lq + 1, lq + 2);
+    twoSum2D(e, lq + 1, lq + 7, lq + 2, lq + 3, lq + 4);
+    twoSum2D(e, lq + 0, lq + 2, lq + 4, lq + 5, lq + 6);
+    // Check r (lq+4) in range, not an exact power of two, and |rerr| + 2*|eerr| < 0.99 * half_ulp(r)
+    fmaRange2D(e, lq + 4, lq + 6);
+    e.get(lq + 4);
+    k64x2(e, 0x000f_ffff_ffff_ffff);
+    e.vop(v128_and);
+    k128(e, 0, 0);
+    e.vop(cm.S.i64x2_ne);
+    e.vop(v128_and);
+    e.get(lq + 5);
+    e.vop(cm.S.f64x2_abs);
+    k64x2(e, @bitCast(@as(f64, 2.0)));
+    e.get(lq + 3);
+    e.vop(cm.S.f64x2_abs);
+    e.vop(cm.S.f64x2_mul);
+    e.vop(cm.S.f64x2_add);
+    e.get(lq + 4);
+    k64x2(e, 0x7ff0_0000_0000_0000);
+    e.vop(v128_and);
+    k64x2(e, @as(u64, 53) << 52);
+    e.vop(op_sub[3]);
+    k64x2(e, @bitCast(@as(f64, 0.99)));
+    e.vop(cm.S.f64x2_mul);
+    e.vop(cm.S.f64x2_lt);
+    e.vop(v128_and);
+    e.vop(cm.S.i64x2_all_true);
+    e.op(W.i64_ext_u);
+    e.set(lu);
+    e.close();
+    e.get(lu);
+    e.op(W.i32_wrap);
+    e.open(W.@"if", W.void_t);
+    e.get(lq + 4);
     cm.setV(e, v.d);
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
 }
 
+fn emitFpMla(e: *Emit, v: V, at: At) void {
+    const dbl = v.size == 3;
+    const sub = v.x == 1;
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    if (e.relaxed_fma) {
+        get(e, v.n);
+        getM(e, v);
+        get(e, v.d);
+        e.vop(if (dbl)
+            (if (sub) cm.S.f64x2_relaxed_nmadd else cm.S.f64x2_relaxed_madd)
+        else
+            (if (sub) cm.S.f32x4_relaxed_nmadd else cm.S.f32x4_relaxed_madd));
+    } else {
+        get(e, v.d);
+        get(e, v.n);
+        getM(e, v);
+        e.vop(if (dbl) cm.S.f64x2_mul else cm.S.f32x4_mul);
+        e.vop(if (dbl)
+            (if (sub) cm.S.f64x2_sub else cm.S.f64x2_add)
+        else
+            (if (sub) cm.S.f32x4_sub else cm.S.f32x4_add));
+    }
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
+    if (e.relaxed_fma) {
+        const r_loc = lq;
+        // Pad inactive lanes for Q = 0 (2S): d = 4.0, n = 1.0, m = 1.0 ->
+        // FMLA = 5.0, FMLS = 3.0 (both safely inRange).
+        normOp(e, v, false, 0x3f80_0000);
+        normOp(e, v, true, 0x3f80_0000);
+        get(e, v.d);
+        if (!v.q) {
+            k32x4(e, 0x4080_0000);
+            shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31 });
+        }
+        e.vop(if (dbl)
+            (if (sub) cm.S.f64x2_relaxed_nmadd else cm.S.f64x2_relaxed_madd)
+        else
+            (if (sub) cm.S.f32x4_relaxed_nmadd else cm.S.f32x4_relaxed_madd));
+        e.set(r_loc);
+        inRangeMask(e, r_loc, dbl);
+        e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
+        fastIxcFrom(e, lt);
+        e.op(W.i32_and);
+        e.open(W.@"if", W.void_t);
+        e.get(r_loc);
+        cm.setVq(e, v.d, v.q);
+        e.op(W.@"else");
+        fastIxcUfc(e);
+        finiteMask(e, r_loc, dbl);
+        e.vop(if (dbl) cm.S.i64x2_all_true else cm.S.i32x4_all_true);
+        e.op(W.i32_and);
+        e.open(W.@"if", W.void_t);
+        e.get(r_loc);
+        cm.setVq(e, v.d, v.q);
+        e.op(W.@"else");
+        vecFpSlow(e, v, at);
+        e.close();
+        e.close();
+    } else if (dbl) {
+        emitFpMla2D(e, v, at);
+    } else {
+        const m_loc = lq;
+        const s_loc = lq + 1;
+        const r0_loc = lq + 2;
+        const r1_loc = lq + 3;
+        const ok_loc = lq + 4;
+        const a_loc = cm.vloc(v.n & 31);
+        const d_loc = cm.vloc(v.d & 31);
+        getM(e, v);
+        e.set(m_loc);
+        emitMlaPair(e, a_loc, m_loc, d_loc, false, sub, s_loc, r0_loc);
+        if (v.q) {
+            e.set(ok_loc);
+            emitMlaPair(e, a_loc, m_loc, d_loc, true, sub, s_loc, r1_loc);
+            e.get(ok_loc);
+            e.vop(v128_and);
+        }
+        e.vop(cm.S.i64x2_all_true);
+        fastIxcFrom(e, lt);
+        e.op(W.i32_and);
+        e.open(W.@"if", W.void_t);
+        e.get(r0_loc);
+        if (v.q) {
+            e.get(r1_loc);
+            shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23 });
+        }
+        cm.setV(e, v.d);
+        e.op(W.@"else");
+        fastIxcUfc(e);
+        e.open(W.@"if", W.void_t);
+        emitMlaSubPair(e, a_loc, m_loc, d_loc, false, sub, r0_loc);
+        if (v.q) {
+            e.set(ok_loc);
+            emitMlaSubPair(e, a_loc, m_loc, d_loc, true, sub, r1_loc);
+            e.get(ok_loc);
+            e.vop(v128_and);
+        }
+        e.vop(cm.S.i64x2_all_true);
+        e.open(W.@"if", W.void_t);
+        e.get(r0_loc);
+        if (v.q) {
+            e.get(r1_loc);
+            shuffle(e, .{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23 });
+        }
+        cm.setV(e, v.d);
+        e.op(W.@"else");
+        vecFpSlow(e, v, at);
+        e.close();
+        e.op(W.@"else");
+        vecFpSlow(e, v, at);
+        e.close();
+        e.close();
+    }
+    e.close();
+}
+
 fn emitFpCvtf(e: *Emit, v: V, at: At) void {
-    fpcrFast(e);
-    ixcSet(e);
-    e.op(W.i32_and);
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
+    fastIxcFrom(e, lt);
     e.open(W.@"if", W.void_t);
     get(e, v.n);
     vop(e, v.code);
@@ -1857,9 +2236,16 @@ fn emitFpCvtf(e: *Emit, v: V, at: At) void {
     e.op(W.@"else");
     vecFpSlow(e, v, at);
     e.close();
+    e.close();
 }
 
 fn emitFpCvtz(e: *Emit, v: V, at: At) void {
+    loadWasmFp(e, lt);
+    e.open(W.@"if", W.void_t);
+    get(e, v.n);
+    vop(e, v.code);
+    cm.setVq(e, v.d, v.q);
+    e.op(W.@"else");
     const a_loc = lq;
     normOp(e, v, false, 0x4080_0000);
     e.set(a_loc);
@@ -1879,9 +2265,7 @@ fn emitFpCvtz(e: *Emit, v: V, at: At) void {
     }
     e.vop(v128_and);
     e.vop(cm.S.i32x4_all_true);
-    fzClear(e);
-    e.op(W.i32_and);
-    ixcSet(e);
+    fzClearIxcFrom(e, lt);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(a_loc);
@@ -1889,6 +2273,7 @@ fn emitFpCvtz(e: *Emit, v: V, at: At) void {
     cm.setVq(e, v.d, v.q);
     e.op(W.@"else");
     vecFpSlow(e, v, at);
+    e.close();
     e.close();
 }
 
@@ -1906,26 +2291,181 @@ fn sigmaV(e: *Emit, l: u32, k: [3]u8, wide: bool) void {
 fn ldst1(e: *Emit, v: V, at: At) void {
     const per: u64 = if (v.q) 16 else 8;
     const load = v.k == .ld1;
-    cm.get(e, v.n);
-    e.set(cm.l_va);
-    e.tlbCheck(at.k, at.pc, if (load) jc.tlb_r_off else jc.tlb_w_off, per * v.sh);
-    if (e.mem32) e.op(W.i64_ext_u);
-    e.set(lu);
+    const a = mem.prepareHost(e, at, v.n, 0, !load, per * v.sh);
     for (0..v.sh) |j| {
         const r: u8 = @intCast((v.d + j) & 31);
-        e.get(lu);
+        e.get(a.local);
         e.addr();
         if (load) {
             e.vop(if (v.q) cm.S.v128_load else cm.S.v128_load64_zero);
             e.uleb(0);
-            e.uleb(per * j);
+            e.uleb(a.off + per * j);
             cm.setV(e, r);
         } else {
             get(e, r);
             e.vop(if (v.q) cm.S.v128_store else cm.S.v128_store64_lane);
             e.uleb(0);
-            e.uleb(per * j);
+            e.uleb(a.off + per * j);
             if (!v.q) e.op(0); // lane
+        }
+    }
+    if (v.x != 0) {
+        cm.get(e, v.n);
+        if (v.x == 1) e.k64(v.imm) else cm.get(e, v.m);
+        e.op(W.i64_add);
+        cm.set(e, v.n);
+    }
+}
+
+// ---- LD2-LD4, ST2-ST4 (multiple structures) -------------------------------------------
+
+fn ldstN(e: *Emit, v: V, at: At) void {
+    const selem: usize = v.sh; // 2..4
+    const per: usize = if (v.q) 16 else 8;
+    const total: usize = per * selem; // 16, 24, 32, 48, 64
+    const chunks: usize = (total + 15) / 16; // 1..4
+    const esz: usize = @as(usize, 1) << v.size;
+    const load = v.k == .ldn;
+    const a = mem.prepareHost(e, at, v.n, 0, !load, total);
+    if (load) {
+        for (0..chunks) |ci| {
+            e.get(a.local);
+            e.addr();
+            if (16 * ci + 16 <= total) {
+                e.vop(cm.S.v128_load);
+            } else {
+                e.vop(cm.S.v128_load64_zero);
+            }
+            e.uleb(0);
+            e.uleb(a.off + 16 * ci);
+            e.set(lq + @as(u32, @intCast(ci)));
+        }
+        for (0..selem) |r| {
+            var src: [16]u8 = @splat(0);
+            for (0..per) |b| {
+                const elem = b / esz;
+                src[b] = @intCast((elem * selem + r) * esz + (b % esz));
+            }
+            if (chunks == 1) {
+                e.get(lq + 0);
+                e.get(lq + 0);
+                shuffle(e, src);
+            } else if (chunks == 2) {
+                e.get(lq + 0);
+                e.get(lq + 1);
+                shuffle(e, src);
+            } else if (chunks == 3) {
+                var idx1: [16]u8 = @splat(0);
+                var idx2: [16]u8 = @splat(0);
+                for (0..per) |b| {
+                    if (src[b] < 32) {
+                        idx1[b] = src[b];
+                        idx2[b] = @intCast(b);
+                    } else {
+                        idx2[b] = 16 + (src[b] - 32);
+                    }
+                }
+                e.get(lq + 0);
+                e.get(lq + 1);
+                shuffle(e, idx1);
+                e.get(lq + 2);
+                shuffle(e, idx2);
+            } else {
+                var idx1: [16]u8 = @splat(0);
+                var idx2: [16]u8 = @splat(0);
+                var idx3: [16]u8 = @splat(0);
+                for (0..per) |b| {
+                    if (src[b] < 32) {
+                        idx1[b] = src[b];
+                        idx3[b] = @intCast(b);
+                    } else {
+                        idx2[b] = src[b] - 32;
+                        idx3[b] = @intCast(16 + b);
+                    }
+                }
+                e.get(lq + 0);
+                e.get(lq + 1);
+                shuffle(e, idx1);
+                e.get(lq + 2);
+                e.get(lq + 3);
+                shuffle(e, idx2);
+                shuffle(e, idx3);
+            }
+            cm.setVq(e, @intCast((v.d + r) & 31), v.q);
+        }
+    } else {
+        for (0..chunks) |ci| {
+            const base_b = 16 * ci;
+            const clen = @min(16, total - base_b);
+            e.get(a.local);
+            e.addr();
+            if (selem == 2) {
+                var idx: [16]u8 = @splat(0);
+                for (0..clen) |j| {
+                    const mb = base_b + j;
+                    const ge = mb / esz;
+                    const r = ge % 2;
+                    const rb = (ge / 2) * esz + (mb % esz);
+                    idx[j] = @intCast(r * 16 + rb);
+                }
+                get(e, v.d);
+                get(e, v.d + 1);
+                shuffle(e, idx);
+            } else if (selem == 3) {
+                var idx1: [16]u8 = @splat(0);
+                var idx2: [16]u8 = @splat(0);
+                for (0..clen) |j| {
+                    const mb = base_b + j;
+                    const ge = mb / esz;
+                    const r = ge % 3;
+                    const rb = (ge / 3) * esz + (mb % esz);
+                    if (r < 2) {
+                        idx1[j] = @intCast(r * 16 + rb);
+                        idx2[j] = @intCast(j);
+                    } else {
+                        idx2[j] = @intCast(16 + rb);
+                    }
+                }
+                get(e, v.d);
+                get(e, v.d + 1);
+                shuffle(e, idx1);
+                get(e, v.d + 2);
+                shuffle(e, idx2);
+            } else {
+                var idx1: [16]u8 = @splat(0);
+                var idx2: [16]u8 = @splat(0);
+                var idx3: [16]u8 = @splat(0);
+                for (0..clen) |j| {
+                    const mb = base_b + j;
+                    const ge = mb / esz;
+                    const r = ge % 4;
+                    const rb = (ge / 4) * esz + (mb % esz);
+                    if (r < 2) {
+                        idx1[j] = @intCast(r * 16 + rb);
+                        idx3[j] = @intCast(j);
+                    } else {
+                        idx2[j] = @intCast((r - 2) * 16 + rb);
+                        idx3[j] = @intCast(16 + j);
+                    }
+                }
+                get(e, v.d);
+                get(e, v.d + 1);
+                shuffle(e, idx1);
+                get(e, v.d + 2);
+                get(e, v.d + 3);
+                shuffle(e, idx2);
+                shuffle(e, idx3);
+            }
+            if (clen == 16) {
+                e.vop(cm.S.v128_store);
+                e.uleb(0);
+                e.uleb(a.off + 16 * ci);
+            } else {
+                e.vop(cm.S.v128_store64_lane);
+                e.uleb(0);
+                e.uleb(a.off + 16 * ci);
+                e.op(0);
+            }
         }
     }
     if (v.x != 0) {
@@ -1942,18 +2482,10 @@ fn ldst1(e: *Emit, v: V, at: At) void {
 fn pairEmit(e: *Emit, v: V, at: At) void {
     const n: u64 = @as(u64, 1) << v.size; // bytes per register (4 << (size - 2))
     const load = v.k == .ldpv;
-    cm.get(e, v.n);
-    if (v.x != 1) {
-        e.k64(v.imm);
-        e.op(W.i64_add);
-    }
-    e.set(cm.l_va);
-    e.tlbCheck(at.k, at.pc, if (load) jc.tlb_r_off else jc.tlb_w_off, 2 * n);
-    if (e.mem32) e.op(W.i64_ext_u);
-    e.set(lu);
+    const a = mem.prepareHost(e, at, v.n, if (v.x != 1) v.imm else 0, !load, 2 * n);
     for (0..2) |j| {
         const r = if (j == 0) v.d else v.m;
-        e.get(lu);
+        e.get(a.local);
         e.addr();
         if (load) {
             e.vop(switch (v.size) {
@@ -1962,7 +2494,7 @@ fn pairEmit(e: *Emit, v: V, at: At) void {
                 else => cm.S.v128_load,
             });
             e.uleb(0);
-            e.uleb(n * j);
+            e.uleb(a.off + n * j);
             cm.setV(e, r);
         } else {
             get(e, r);
@@ -1972,7 +2504,7 @@ fn pairEmit(e: *Emit, v: V, at: At) void {
                 else => cm.S.v128_store,
             });
             e.uleb(0);
-            e.uleb(n * j);
+            e.uleb(a.off + n * j);
             if (v.size != 4) e.op(0);
         }
     }
@@ -1987,15 +2519,13 @@ fn pairEmit(e: *Emit, v: V, at: At) void {
 /// LD1/ST1 of one lane, LD1R: one access of 1 << size bytes.
 fn ldstSingle(e: *Emit, v: V, at: At) void {
     const n: u64 = @as(u64, 1) << v.size;
-    cm.get(e, v.n);
-    e.set(cm.l_va);
-    e.tlbCheck(at.k, at.pc, if (v.k == .st1s) jc.tlb_w_off else jc.tlb_r_off, n);
+    const off = mem.prepareAddr(e, at, v.n, 0, v.k == .st1s, n);
     switch (v.k) {
         .ld1s => {
             get(e, v.d);
             e.vop(@as(u32, 0x54) + v.size); // v128.load{8,16,32,64}_lane
             e.uleb(0);
-            e.uleb(0);
+            e.uleb(off);
             e.op(v.idx[0]);
             cm.setV(e, v.d);
         },
@@ -2003,13 +2533,13 @@ fn ldstSingle(e: *Emit, v: V, at: At) void {
             get(e, v.d);
             e.vop(@as(u32, 0x58) + v.size); // v128.store{8,16,32,64}_lane
             e.uleb(0);
-            e.uleb(0);
+            e.uleb(off);
             e.op(v.idx[0]);
         },
         else => {
             e.vop(@as(u32, 0x07) + v.size); // v128.load{8,16,32,64}_splat
             e.uleb(0);
-            e.uleb(0);
+            e.uleb(off);
             cm.setVq(e, v.d, v.q);
         },
     }
@@ -2573,7 +3103,7 @@ fn genLd1(r: std.Random, out: []u32, pc: u64) usize {
     const t = vreg(r);
     const q = r.uintLessThan(u32, 2) << 30;
     const l = r.uintLessThan(u32, 2) << 22;
-    const opc = pick(r, u32, &.{ 0b0111, 0b1010, 0b0110, 0b0010, 0b1000 });
+    const opc = pick(r, u32, &.{ 0b0111, 0b1010, 0b0110, 0b0010, 0b1000, 0b0100, 0b0000 });
     const base = pick(r, u32, &.{ 20, 21, 22, 31, 19 });
     const post: u32 = switch (r.uintLessThan(u32, 3)) {
         0 => 0,

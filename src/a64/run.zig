@@ -11,6 +11,7 @@
 const std = @import("std");
 const core = @import("../cpu/core.zig");
 const kwemu = @import("../emu/kwemu.zig");
+const fatwasm = @import("../emu/fatwasm.zig");
 const c = @import("common.zig");
 const decode = @import("decode.zig");
 const branch = @import("branch.zig");
@@ -142,9 +143,18 @@ pub fn exportAbi() void {
     // (js/core/jit.ts) needs to read them.
     @export(&kw_debug_run_ref, .{ .name = "kw_debug_run_ref" });
     @export(&kw_debug_last_stop, .{ .name = "kw_debug_last_stop" });
+    @export(&kw_fat_reset, .{ .name = "kw_fat_reset" });
+    @export(&kw_fat_register, .{ .name = "kw_fat_register" });
     if (kwemu.stats_on) @export(&kw_debug_stats, .{ .name = "kw_debug_stats" });
     if (kwemu.stats_on and @import("../emu/jitcore.zig").enabled)
         @export(&kwemu.kw_debug_cpu_of_jit_buf, .{ .name = "kw_debug_cpu_of_jit_buf" });
+}
+
+fn kw_fat_reset() callconv(.c) void {
+    fatwasm.reset();
+}
+fn kw_fat_register(id: u32, flags: u32, ptr: [*]const u8, len: usize) callconv(.c) i32 {
+    return fatwasm.register(id, flags, ptr, len);
 }
 
 fn kw_debug_run_ref(cpu: *Cpu, regs: *Regs) callconv(.c) u32 {
@@ -194,6 +204,7 @@ fn kw_set_isa(cpu: *Cpu, isa: u64) callconv(.c) u64 {
     return setIsa(cpu, isa);
 }
 fn kw_host_reset(cpu: *Cpu) callconv(.c) void {
+    fatwasm.forgetHost();
     kwemu.hostReset(cpu);
     tier.epochInit(cpu);
 }

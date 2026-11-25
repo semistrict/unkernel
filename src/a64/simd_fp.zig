@@ -140,7 +140,7 @@ inline fn fpcr(s: c.St) u32 {
     return s.r.fpcr;
 }
 inline fn raise(s: c.St, fl: u32) void {
-    s.r.fpsr |= fl;
+    if (!c.wasmFpMode(s.r.fpcr)) s.r.fpsr |= fl;
 }
 
 // ---- three same ----------------------------------------------------------------

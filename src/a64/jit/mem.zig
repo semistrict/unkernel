@@ -25,6 +25,9 @@ const ops = @import("../ops.zig");
 const jc = @import("../../emu/jitcore.zig");
 const jit = @import("emit.zig");
 const cm = @import("common.zig");
+const gen_mod = @import("generic.zig");
+const atomic_mod = @import("atomic.zig");
+const vec_mod = @import("vec.zig");
 const Op = ops.Op;
 const H = ops.H;
 const Use = jit.Use;
@@ -40,11 +43,51 @@ pub const kinds = [_]ops.H{
     .ldp_q_w, .stp_q,   .stp_q_w,
 };
 
-/// This family's part of the module's emission state (`e.x.mem`).
-pub const Ext = struct {};
+const max_ops = 65; // tier.max_block + trailing goto
+const max_groups = 16;
+const max_slots = cm.n_mem;
+const max_cache = cm.n_mcache / 3;
+const max_span: i64 = 256;
+const max_delta: i64 = 1 << 28;
+const no_cache: u8 = 0xff;
 
-/// The host address of a pair or Q access (i64), kept for its other parts.
-const l_host: u32 = cm.l_mem;
+// op_tag encoding per op index k:
+//   0                                    : single (no loop cache)
+//   1 .. max_cache                       : single with loop cache slot (tag - 1)
+//   tag_head .. tag_head + max_groups-1  : head of coalesced group (tag - tag_head)
+//   tag_follow ..                        : follower of coalesced group (tag - tag_follow)
+const tag_head: u8 = 1 + max_cache;
+const tag_follow: u8 = tag_head + max_groups;
+
+const flag_write: u8 = 1;
+const flag_reg: u8 = 2;
+
+const Group = struct {
+    va_off: i32,
+    span_m1: u8,
+    slot: u8,
+    cache: u8,
+    flags: u8,
+};
+
+/// This family's part of the module's emission state (`e.x.mem`).
+/// Arrays are left `undefined` by default so default-initializing `Emit`
+/// emits no bulk zeroing/memcpy; `beginMember` initializes `op_tag[0..n_ops]`.
+pub const Ext = struct {
+    n_ops: u8 = 0,
+    op_tag: [max_ops]u8 = undefined,
+    op_delta: [max_ops]u8 = undefined,
+    groups: [max_groups]Group = undefined,
+};
+
+/// Host-address local + wasm memory offset for multi-part accesses.
+pub const Host = struct {
+    local: u32,
+    off: u64,
+};
+
+/// Scratch local for an uncoalesced multi-part access (never live across ops).
+const l_host_tmp: u32 = cm.l_t;
 
 /// Bytes of one element of kind h (one register of a pair, a Q half: 8).
 fn width(h: H) u64 {
@@ -165,18 +208,127 @@ fn writeback(e: *Emit, o: Op) void {
     cm.set(e, o.b);
 }
 
-/// After `e.tlbCheck`: keep the host address in l_host as well (on a
-/// memory32 kernel it is an i32 operand by now: widen it for the i64
-/// local) and leave it on the stack.
-fn keepHost(e: *Emit) void {
-    if (e.mem32) e.op(W.i64_ext_u);
-    e.tee(l_host);
+/// Push the kept host address in `local` as a memory operand.
+fn host(e: *Emit, local: u32) void {
+    e.get(local);
     e.addr();
 }
-/// Push the kept host address as a memory operand.
-fn host(e: *Emit) void {
-    e.get(l_host);
+
+/// Emit a 64-bit TLB check (cached when in a standalone self-loop with a
+/// cache slot, else direct), leaving the 64-bit host address on the stack.
+fn emitTlb64(e: *Emit, at: At, is_write: bool, size: u64, cache: u8) void {
+    const tlb_off: u64 = if (is_write) jc.tlb_w_off else jc.tlb_r_off;
+    if (e.rg == null and at.self_loop and cache < max_cache) {
+        const base = cm.l_mcache + @as(u32, cache) * 3;
+        e.tlbCheckCached64(at.k, at.pc, tlb_off, size, base, base + 1, base + 2);
+    } else {
+        e.tlbCheck64(at.k, at.pc, tlb_off, size);
+    }
+}
+
+fn tagOf(e: *const Emit, k: usize) u8 {
+    return if (k < e.x.mem.n_ops) e.x.mem.op_tag[k] else 0;
+}
+
+/// Prepare a host address on the stack (wrapped by `e.addr()`) for a
+/// base+imm access (used by vec.zig `ldstSingle`), returning its wasm
+/// memory offset.
+pub fn prepareAddr(e: *Emit, at: At, base: u8, imm: u64, is_write: bool, size: u64) u64 {
+    const tag = tagOf(e, at.k);
+    if (tag >= tag_follow) {
+        const g = e.x.mem.groups[tag - tag_follow];
+        host(e, cm.l_mem + g.slot);
+        return e.x.mem.op_delta[at.k];
+    }
+    if (tag >= tag_head) {
+        const g = e.x.mem.groups[tag - tag_head];
+        vaImm(e, base, @bitCast(@as(i64, g.va_off)));
+        emitTlb64(e, at, g.flags & flag_write != 0, @as(u64, g.span_m1) + 1, g.cache);
+        e.tee(cm.l_mem + g.slot);
+        e.addr();
+        return e.x.mem.op_delta[at.k];
+    }
+    vaImm(e, base, imm);
+    emitTlb64(e, at, is_write, size, if (tag > 0) tag - 1 else no_cache);
     e.addr();
+    return 0;
+}
+
+/// Prepare a host address in an i64 local for a multi-part base+imm access
+/// (used by vec.zig `ldst1` and `pairEmit`), returning `(local, off)`.
+pub fn prepareHost(e: *Emit, at: At, base: u8, imm: u64, is_write: bool, size: u64) Host {
+    const tag = tagOf(e, at.k);
+    if (tag >= tag_follow) {
+        const g = e.x.mem.groups[tag - tag_follow];
+        return .{ .local = cm.l_mem + g.slot, .off = e.x.mem.op_delta[at.k] };
+    }
+    if (tag >= tag_head) {
+        const g = e.x.mem.groups[tag - tag_head];
+        vaImm(e, base, @bitCast(@as(i64, g.va_off)));
+        emitTlb64(e, at, g.flags & flag_write != 0, @as(u64, g.span_m1) + 1, g.cache);
+        const l = cm.l_mem + g.slot;
+        e.set(l);
+        return .{ .local = l, .off = e.x.mem.op_delta[at.k] };
+    }
+    vaImm(e, base, imm);
+    emitTlb64(e, at, is_write, size, if (tag > 0) tag - 1 else no_cache);
+    e.set(l_host_tmp);
+    return .{ .local = l_host_tmp, .off = 0 };
+}
+
+fn emitOpVa(e: *Emit, o: Op) void {
+    switch (o.h) {
+        .ldr8_r, .ldr16_r, .ldr32_r, .ldr64_r, .str8_r, .str16_r, .str32_r, .str64_r, .ldr_q_r, .str_q_r => vaReg(e, o.b, o.c, o.e, o.f, o.imm),
+        .ldr8_w, .ldr16_w, .ldr32_w, .ldr64_w, .str8_w, .str16_w, .str32_w, .str64_w, .ldr_q_w, .str_q_w => vaIndex(e, o, o.f),
+        .ldp32_w, .ldp64_w, .stp32_w, .stp64_w, .ldp_q_w, .stp_q_w => vaIndex(e, o, o.e),
+        .ldr_v => switch (o.e) {
+            0 => vaImm(e, o.b, o.imm),
+            1 => vaIndex(e, o, o.f),
+            else => vaReg(e, o.b, o.c, o.f, o.g, o.imm),
+        },
+        else => vaImm(e, o.b, o.imm),
+    }
+}
+
+fn prepareAddrOp(e: *Emit, o: Op, at: At, is_write: bool, size: u64) u64 {
+    const tag = tagOf(e, at.k);
+    if (tag >= tag_follow) {
+        const g = e.x.mem.groups[tag - tag_follow];
+        host(e, cm.l_mem + g.slot);
+        return e.x.mem.op_delta[at.k];
+    }
+    if (tag >= tag_head) {
+        const g = e.x.mem.groups[tag - tag_head];
+        if (g.flags & flag_reg != 0) emitOpVa(e, o) else vaImm(e, o.b, @bitCast(@as(i64, g.va_off)));
+        emitTlb64(e, at, g.flags & flag_write != 0, @as(u64, g.span_m1) + 1, g.cache);
+        e.tee(cm.l_mem + g.slot);
+        e.addr();
+        return e.x.mem.op_delta[at.k];
+    }
+    emitOpVa(e, o);
+    emitTlb64(e, at, is_write, size, if (tag > 0) tag - 1 else no_cache);
+    e.addr();
+    return 0;
+}
+
+fn prepareHostOp(e: *Emit, o: Op, at: At, is_write: bool, size: u64) Host {
+    const tag = tagOf(e, at.k);
+    if (tag >= tag_follow) {
+        const g = e.x.mem.groups[tag - tag_follow];
+        return .{ .local = cm.l_mem + g.slot, .off = e.x.mem.op_delta[at.k] };
+    }
+    if (tag >= tag_head) {
+        const g = e.x.mem.groups[tag - tag_head];
+        if (g.flags & flag_reg != 0) emitOpVa(e, o) else vaImm(e, o.b, @bitCast(@as(i64, g.va_off)));
+        emitTlb64(e, at, g.flags & flag_write != 0, @as(u64, g.span_m1) + 1, g.cache);
+        const l = cm.l_mem + g.slot;
+        e.set(l);
+        return .{ .local = l, .off = e.x.mem.op_delta[at.k] };
+    }
+    emitOpVa(e, o);
+    emitTlb64(e, at, is_write, size, if (tag > 0) tag - 1 else no_cache);
+    e.set(l_host_tmp);
+    return .{ .local = l_host_tmp, .off = 0 };
 }
 
 /// With SIMD: a v128 load or store at the address operand on the stack.
@@ -210,8 +362,6 @@ fn storeOp(size: u64) u8 {
 // ---- emission -----------------------------------------------------------------
 
 pub fn emit(e: *Emit, o: Op, at: At) void {
-    const r_off = jc.tlb_r_off;
-    const w_off = jc.tlb_w_off;
     const size = width(o.h);
     switch (o.h) {
         .ldr8_i, .ldr16_i, .ldr32_i, .ldr64_i, .ldr8_w, .ldr16_w, .ldr32_w, .ldr64_w, .ldr8_r, .ldr16_r, .ldr32_r, .ldr64_r => {
@@ -219,13 +369,9 @@ pub fn emit(e: *Emit, o: Op, at: At) void {
                 .ldr8_w, .ldr16_w, .ldr32_w, .ldr64_w => true,
                 else => false,
             };
-            switch (o.h) {
-                .ldr8_r, .ldr16_r, .ldr32_r, .ldr64_r => vaReg(e, o.b, o.c, o.e, o.f, o.imm),
-                else => if (wb) vaIndex(e, o, o.f) else vaImm(e, o.b, o.imm),
-            }
-            e.tlbCheck(at.k, at.pc, r_off, size);
+            const off = prepareAddrOp(e, o, at, false, size);
             const signed = o.d != 0;
-            e.mem(loadOp(size, signed), 0, 0);
+            e.mem(loadOp(size, signed), 0, off);
             if (signed and o.g & 1 != 0) {
                 e.k64(0xffff_ffff);
                 e.op(W.i64_and);
@@ -239,134 +385,108 @@ pub fn emit(e: *Emit, o: Op, at: At) void {
                 .str8_w, .str16_w, .str32_w, .str64_w => true,
                 else => false,
             };
-            switch (o.h) {
-                .str8_r, .str16_r, .str32_r, .str64_r => vaReg(e, o.b, o.c, o.e, o.f, o.imm),
-                else => if (wb) vaIndex(e, o, o.f) else vaImm(e, o.b, o.imm),
-            }
-            e.tlbCheck(at.k, at.pc, w_off, size);
+            const off = prepareAddrOp(e, o, at, true, size);
             cm.get(e, o.a);
-            e.mem(storeOp(size), 0, 0);
+            e.mem(storeOp(size), 0, off);
             if (wb) writeback(e, o);
         },
         .ldp32, .ldp64, .ldp32_w, .ldp64_w => {
             const wb = o.h == .ldp32_w or o.h == .ldp64_w;
-            if (wb) vaIndex(e, o, o.e) else vaImm(e, o.b, o.imm);
-            e.tlbCheck(at.k, at.pc, r_off, 2 * size);
-            keepHost(e);
+            const a = prepareHostOp(e, o, at, false, 2 * size);
             const signed = o.d != 0; // LDPSW
-            e.mem(loadOp(size, signed), 0, 0);
+            host(e, a.local);
+            e.mem(loadOp(size, signed), 0, a.off);
             cm.set(e, o.a);
-            host(e);
-            e.mem(loadOp(size, signed), 0, size);
+            host(e, a.local);
+            e.mem(loadOp(size, signed), 0, a.off + size);
             cm.set(e, o.c); // after Rt: Rt2 wins when they are equal
             if (wb and o.b != o.a and o.b != o.c) writeback(e, o);
         },
         .stp32, .stp64, .stp32_w, .stp64_w => {
             const wb = o.h == .stp32_w or o.h == .stp64_w;
-            if (wb) vaIndex(e, o, o.e) else vaImm(e, o.b, o.imm);
-            e.tlbCheck(at.k, at.pc, w_off, 2 * size);
-            keepHost(e);
+            const a = prepareHostOp(e, o, at, true, 2 * size);
+            host(e, a.local);
             cm.get(e, o.a);
-            e.mem(storeOp(size), 0, 0);
-            host(e);
+            e.mem(storeOp(size), 0, a.off);
+            host(e, a.local);
             cm.get(e, o.c);
-            e.mem(storeOp(size), 0, size);
+            e.mem(storeOp(size), 0, a.off + size);
             if (wb) writeback(e, o);
         },
         .ldr_v => {
             const n: u64 = @as(u64, 1) << @intCast(o.d);
-            switch (o.e) {
-                0 => vaImm(e, o.b, o.imm),
-                1 => vaIndex(e, o, o.f),
-                else => vaReg(e, o.b, o.c, o.f, o.g, o.imm),
-            }
-            e.tlbCheck(at.k, at.pc, r_off, n);
-            e.mem(loadOp(n, false), 0, 0);
+            const off = prepareAddrOp(e, o, at, false, n);
+            e.mem(loadOp(n, false), 0, off);
             if (o.e == 1) writeback(e, o); // the base is an X register
             cm.setScalar(e, o.a);
         },
         .ldr_q_i, .ldr_q_w, .ldr_q_r => {
-            switch (o.h) {
-                .ldr_q_i => vaImm(e, o.b, o.imm),
-                .ldr_q_w => vaIndex(e, o, o.f),
-                else => vaReg(e, o.b, o.c, o.e, o.f, o.imm),
-            }
-            e.tlbCheck(at.k, at.pc, r_off, 16);
             if (e.simd) {
-                vmem(e, cm.S.v128_load, 0);
+                const off = prepareAddrOp(e, o, at, false, 16);
+                vmem(e, cm.S.v128_load, off);
                 cm.setV(e, vreg(o.a));
             } else {
-                keepHost(e);
-                e.mem(W.i64_load, 0, 0);
+                const a = prepareHostOp(e, o, at, false, 16);
+                host(e, a.local);
+                e.mem(W.i64_load, 0, a.off);
                 cm.set(e, o.a);
-                host(e);
-                e.mem(W.i64_load, 0, 8);
+                host(e, a.local);
+                e.mem(W.i64_load, 0, a.off + 8);
                 cm.set(e, o.a + 1);
             }
             if (o.h == .ldr_q_w) writeback(e, o);
         },
         .str_q_i, .str_q_w, .str_q_r => {
-            switch (o.h) {
-                .str_q_i => vaImm(e, o.b, o.imm),
-                .str_q_w => vaIndex(e, o, o.f),
-                else => vaReg(e, o.b, o.c, o.e, o.f, o.imm),
-            }
-            e.tlbCheck(at.k, at.pc, w_off, 16);
             if (e.simd) {
+                const off = prepareAddrOp(e, o, at, true, 16);
                 cm.getV(e, vreg(o.a));
-                vmem(e, cm.S.v128_store, 0);
+                vmem(e, cm.S.v128_store, off);
             } else {
-                keepHost(e);
+                const a = prepareHostOp(e, o, at, true, 16);
+                host(e, a.local);
                 cm.get(e, o.a);
-                e.mem(W.i64_store, 0, 0);
-                host(e);
+                e.mem(W.i64_store, 0, a.off);
+                host(e, a.local);
                 cm.get(e, o.a + 1);
-                e.mem(W.i64_store, 0, 8);
+                e.mem(W.i64_store, 0, a.off + 8);
             }
             if (o.h == .str_q_w) writeback(e, o);
         },
         .ldp_q, .ldp_q_w => {
-            if (o.h == .ldp_q_w) vaIndex(e, o, o.e) else vaImm(e, o.b, o.imm);
-            e.tlbCheck(at.k, at.pc, r_off, 32);
-            keepHost(e);
+            const a = prepareHostOp(e, o, at, false, 32);
             if (e.simd) {
                 // Rt, then Rt2: Rt2 wins when they are equal.
-                vmem(e, cm.S.v128_load, 0);
+                host(e, a.local);
+                vmem(e, cm.S.v128_load, a.off);
                 cm.setV(e, vreg(o.a));
-                host(e);
-                vmem(e, cm.S.v128_load, 16);
+                host(e, a.local);
+                vmem(e, cm.S.v128_load, a.off + 16);
                 cm.setV(e, vreg(o.c));
             } else {
-                e.mem(W.i64_load, 0, 0);
-                cm.set(e, o.a);
-                // Rt's halves, then Rt2's: Rt2 wins when they are equal.
-                const rest = [3]struct { u64, u8 }{ .{ 8, o.a + 1 }, .{ 16, o.c }, .{ 24, o.c + 1 } };
-                for (rest) |p| {
-                    host(e);
-                    e.mem(W.i64_load, 0, p[0]);
+                const parts = [4]struct { u64, u8 }{ .{ 0, o.a }, .{ 8, o.a + 1 }, .{ 16, o.c }, .{ 24, o.c + 1 } };
+                for (parts) |p| {
+                    host(e, a.local);
+                    e.mem(W.i64_load, 0, a.off + p[0]);
                     cm.set(e, p[1]);
                 }
             }
             if (o.h == .ldp_q_w) writeback(e, o);
         },
         .stp_q, .stp_q_w => {
-            if (o.h == .stp_q_w) vaIndex(e, o, o.e) else vaImm(e, o.b, o.imm);
-            e.tlbCheck(at.k, at.pc, w_off, 32);
-            keepHost(e);
+            const a = prepareHostOp(e, o, at, true, 32);
             if (e.simd) {
+                host(e, a.local);
                 cm.getV(e, vreg(o.a));
-                vmem(e, cm.S.v128_store, 0);
-                host(e);
+                vmem(e, cm.S.v128_store, a.off);
+                host(e, a.local);
                 cm.getV(e, vreg(o.c));
-                vmem(e, cm.S.v128_store, 16);
+                vmem(e, cm.S.v128_store, a.off + 16);
             } else {
-                cm.get(e, o.a);
-                e.mem(W.i64_store, 0, 0);
-                const rest = [3]struct { u64, u8 }{ .{ 8, o.a + 1 }, .{ 16, o.c }, .{ 24, o.c + 1 } };
-                for (rest) |p| {
-                    host(e);
+                const parts = [4]struct { u64, u8 }{ .{ 0, o.a }, .{ 8, o.a + 1 }, .{ 16, o.c }, .{ 24, o.c + 1 } };
+                for (parts) |p| {
+                    host(e, a.local);
                     cm.get(e, p[1]);
-                    e.mem(W.i64_store, 0, p[0]);
+                    e.mem(W.i64_store, 0, a.off + p[0]);
                 }
             }
             if (o.h == .stp_q_w) writeback(e, o);
@@ -375,8 +495,505 @@ pub fn emit(e: *Emit, o: Op, at: At) void {
     }
 }
 
+// ---- intra-block TLB coalescing & self-loop page cache analysis ---------------
+
+const AccessKind = enum { base_imm, reg_off };
+
+const Access = struct {
+    kind: AccessKind,
+    base: u8, // 0..31
+    is_write: bool,
+    size: u8,
+    acc_off: i64 = 0,
+    wb: bool = false,
+    wb_imm: i64 = 0,
+    wb_kill: bool = false,
+    dest_mask: u32 = 0, // X registers overwritten by load data (excl. writeback)
+    idx_reg: u8 = ops.zr,
+    s1: u8 = 0,
+    s2: u8 = 0,
+    mask: u64 = 0,
+};
+
+fn classifyMemOp(o: Op) ?Access {
+    const sz: u8 = @intCast(width(o.h));
+    switch (o.h) {
+        .ldr8_i, .ldr16_i, .ldr32_i, .ldr64_i => {
+            if (o.b >= 32) return null; // literal
+            return .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = sz, .acc_off = @bitCast(o.imm), .dest_mask = cm.xbit(o.a) };
+        },
+        .ldr8_w, .ldr16_w, .ldr32_w, .ldr64_w => {
+            if (o.b >= 32) return null;
+            const imm: i64 = @bitCast(o.imm);
+            return .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = sz, .acc_off = if (o.f != 0) imm else 0, .wb = true, .wb_imm = imm, .dest_mask = cm.xbit(o.a) };
+        },
+        .ldr8_r, .ldr16_r, .ldr32_r, .ldr64_r => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .reg_off, .base = o.b, .is_write = false, .size = sz, .dest_mask = cm.xbit(o.a), .idx_reg = o.c, .s1 = o.e & 63, .s2 = o.f & 63, .mask = o.imm };
+        },
+        .str8_i, .str16_i, .str32_i, .str64_i => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .base_imm, .base = o.b, .is_write = true, .size = sz, .acc_off = @bitCast(o.imm) };
+        },
+        .str8_w, .str16_w, .str32_w, .str64_w => {
+            if (o.b >= 32) return null;
+            const imm: i64 = @bitCast(o.imm);
+            return .{ .kind = .base_imm, .base = o.b, .is_write = true, .size = sz, .acc_off = if (o.f != 0) imm else 0, .wb = true, .wb_imm = imm };
+        },
+        .str8_r, .str16_r, .str32_r, .str64_r => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .reg_off, .base = o.b, .is_write = true, .size = sz, .idx_reg = o.c, .s1 = o.e & 63, .s2 = o.f & 63, .mask = o.imm };
+        },
+        .ldp32, .ldp64 => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = 2 * sz, .acc_off = @bitCast(o.imm), .dest_mask = cm.xbit(o.a) | cm.xbit(o.c) };
+        },
+        .ldp32_w, .ldp64_w => {
+            if (o.b >= 32) return null;
+            const imm: i64 = @bitCast(o.imm);
+            return .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = 2 * sz, .acc_off = if (o.e != 0) imm else 0, .wb = true, .wb_imm = imm, .dest_mask = cm.xbit(o.a) | cm.xbit(o.c) };
+        },
+        .stp32, .stp64 => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .base_imm, .base = o.b, .is_write = true, .size = 2 * sz, .acc_off = @bitCast(o.imm) };
+        },
+        .stp32_w, .stp64_w => {
+            if (o.b >= 32) return null;
+            const imm: i64 = @bitCast(o.imm);
+            return .{ .kind = .base_imm, .base = o.b, .is_write = true, .size = 2 * sz, .acc_off = if (o.e != 0) imm else 0, .wb = true, .wb_imm = imm };
+        },
+        .ldr_v => {
+            if (o.b >= 32) return null;
+            const n: u8 = @as(u8, 1) << @intCast(o.d);
+            return switch (o.e) {
+                0 => .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = n, .acc_off = @bitCast(o.imm) },
+                1 => blk: {
+                    const imm: i64 = @bitCast(o.imm);
+                    break :blk .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = n, .acc_off = if (o.f != 0) imm else 0, .wb = true, .wb_imm = imm };
+                },
+                else => .{ .kind = .reg_off, .base = o.b, .is_write = false, .size = n, .idx_reg = o.c, .s1 = o.f & 63, .s2 = o.g & 63, .mask = o.imm },
+            };
+        },
+        .ldr_q_i => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = 16, .acc_off = @bitCast(o.imm) };
+        },
+        .ldr_q_w => {
+            if (o.b >= 32) return null;
+            const imm: i64 = @bitCast(o.imm);
+            return .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = 16, .acc_off = if (o.f != 0) imm else 0, .wb = true, .wb_imm = imm };
+        },
+        .ldr_q_r => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .reg_off, .base = o.b, .is_write = false, .size = 16, .idx_reg = o.c, .s1 = o.e & 63, .s2 = o.f & 63, .mask = o.imm };
+        },
+        .str_q_i => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .base_imm, .base = o.b, .is_write = true, .size = 16, .acc_off = @bitCast(o.imm) };
+        },
+        .str_q_w => {
+            if (o.b >= 32) return null;
+            const imm: i64 = @bitCast(o.imm);
+            return .{ .kind = .base_imm, .base = o.b, .is_write = true, .size = 16, .acc_off = if (o.f != 0) imm else 0, .wb = true, .wb_imm = imm };
+        },
+        .str_q_r => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .reg_off, .base = o.b, .is_write = true, .size = 16, .idx_reg = o.c, .s1 = o.e & 63, .s2 = o.f & 63, .mask = o.imm };
+        },
+        .ldp_q => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = 32, .acc_off = @bitCast(o.imm) };
+        },
+        .ldp_q_w => {
+            if (o.b >= 32) return null;
+            const imm: i64 = @bitCast(o.imm);
+            return .{ .kind = .base_imm, .base = o.b, .is_write = false, .size = 32, .acc_off = if (o.e != 0) imm else 0, .wb = true, .wb_imm = imm };
+        },
+        .stp_q => {
+            if (o.b >= 32) return null;
+            return .{ .kind = .base_imm, .base = o.b, .is_write = true, .size = 32, .acc_off = @bitCast(o.imm) };
+        },
+        .stp_q_w => {
+            if (o.b >= 32) return null;
+            const imm: i64 = @bitCast(o.imm);
+            return .{ .kind = .base_imm, .base = o.b, .is_write = true, .size = 32, .acc_off = if (o.e != 0) imm else 0, .wb = true, .wb_imm = imm };
+        },
+        else => return null,
+    }
+}
+
+fn classifyVecOp(v: vec_mod.V) ?Access {
+    return switch (v.k) {
+        .ldpv, .stpv => blk: {
+            const n: u8 = @as(u8, 1) << v.size;
+            const imm: i64 = @bitCast(v.imm);
+            break :blk .{
+                .kind = .base_imm,
+                .base = v.n,
+                .is_write = v.k == .stpv,
+                .size = 2 * n,
+                .acc_off = if (v.x != 1) imm else 0,
+                .wb = v.x == 1 or v.x == 3,
+                .wb_imm = imm,
+            };
+        },
+        .ld1, .st1, .ldn, .stn => .{
+            .kind = .base_imm,
+            .base = v.n,
+            .is_write = v.k == .st1 or v.k == .stn,
+            .size = (if (v.q) @as(u8, 16) else 8) * v.sh,
+            .wb = v.x == 1,
+            .wb_imm = @bitCast(v.imm),
+            .wb_kill = v.x == 2,
+        },
+        .ld1s, .st1s, .ld1r => .{
+            .kind = .base_imm,
+            .base = v.n,
+            .is_write = v.k == .st1s,
+            .size = @as(u8, 1) << v.size,
+            .wb = v.x == 1,
+            .wb_imm = @bitCast(v.imm),
+            .wb_kill = v.x == 2,
+        },
+        else => null,
+    };
+}
+
+const RegVal = struct {
+    root: u8,
+    ver: u16,
+    delta: i64,
+    exact_ver: u16,
+};
+
+const Cand = struct {
+    kind: AccessKind,
+    root: u8,
+    ver: u16,
+    idx_reg: u8,
+    idx_ver: u16,
+    s1: u8,
+    s2: u8,
+    mask: u64,
+    seg_id: u16,
+    head_k: u8,
+    last_k: u8,
+    head_delta: i64,
+    min_off: i64,
+    max_end: i64,
+    is_write: bool,
+    count: u8,
+};
+
+const max_cand = 32;
+const no_cand: u8 = 0xff;
+
+fn inBounds(v: i64) bool {
+    return v >= -max_delta and v <= max_delta;
+}
+
 pub fn beginMember(e: *Emit, o: []const Op) void {
-    _ = .{ e, o };
+    const n: usize = @min(o.len, max_ops);
+    e.x.mem.n_ops = @intCast(n);
+    for (0..n) |k| {
+        e.x.mem.op_tag[k] = 0;
+        e.x.mem.op_delta[k] = 0;
+    }
+
+    var reg: [32]RegVal = undefined;
+    for (0..32) |r| reg[r] = .{ .root = @intCast(r), .ver = 0, .delta = 0, .exact_ver = 0 };
+    var next_ver: u16 = 1;
+    var seg_id: u16 = 0;
+
+    var cands: [max_cand]Cand = undefined;
+    var n_cands: usize = 0;
+    var min_cand: usize = 0;
+    var op_cand: [max_ops]u8 = @splat(no_cand);
+    var op_off: [max_ops]i64 = @splat(0);
+    var is_mem_op: [max_ops]bool = @splat(false);
+    var has_generic_call = false;
+
+    for (o[0..n], 0..) |op, k| {
+        const fam = jit.family(op.h);
+        var acc: ?Access = null;
+        var generic_call = false;
+        var wmask: u32 = 0;
+
+        if (fam == .mem) {
+            is_mem_op[k] = true;
+            acc = classifyMemOp(op);
+            if (acc == null) wmask = usage(op).write; // literal load
+        } else if (fam == .none) {
+            const fast = gen_mod.decode(op.aux());
+            const aa: ?atomic_mod.A = if (fast == null) atomic_mod.decode(op.aux()) else null;
+            const aok = if (aa) |a| atomic_mod.enabled(e, a) else false;
+            const zl: ?Op = if (fast == null and aa == null) jit.xzrLoad(op) else null;
+            const vv: ?vec_mod.V = if (fast == null and aa == null and zl == null) vec_mod.decode(op.aux()) else null;
+            const vok = if (vv) |v| vec_mod.enabled(e, v) else false;
+            if (fast) |f| {
+                wmask = gen_mod.usage(f).write;
+            } else if (aok) {
+                wmask = atomic_mod.usage(aa.?).write;
+            } else if (zl) |l| {
+                is_mem_op[k] = true;
+                acc = classifyMemOp(l);
+                if (acc == null) wmask = usage(l).write;
+            } else if (vok) {
+                acc = classifyVecOp(vv.?);
+                if (acc != null) {
+                    is_mem_op[k] = true;
+                } else {
+                    wmask = vec_mod.usage(vv.?).write;
+                }
+            } else {
+                generic_call = true;
+            }
+        } else if (fam == .branch) {
+            if (ops.isSide(op.h)) {
+                seg_id += 1;
+            } else {
+                wmask = jit.usage(op).write;
+            }
+        } else if (fam == .alu) {
+            if (op.h == .add_i and op.d == 0 and op.a < 32 and op.b < 32) {
+                const imm_s: i64 = @bitCast(op.imm);
+                const src = reg[op.b];
+                if (inBounds(imm_s) and inBounds(src.delta + imm_s)) {
+                    reg[op.a] = .{ .root = src.root, .ver = src.ver, .delta = src.delta + imm_s, .exact_ver = next_ver };
+                    next_ver += 1;
+                } else {
+                    reg[op.a] = .{ .root = op.a, .ver = next_ver, .delta = 0, .exact_ver = next_ver };
+                    next_ver += 1;
+                }
+                continue;
+            } else if (op.h == .mov and op.imm == std.math.maxInt(u64) and op.a < 32 and op.b < 32) {
+                const src = reg[op.b];
+                reg[op.a] = .{ .root = src.root, .ver = src.ver, .delta = src.delta, .exact_ver = next_ver };
+                next_ver += 1;
+                continue;
+            } else {
+                wmask = jit.usage(op).write;
+            }
+        } else {
+            wmask = jit.usage(op).write;
+        }
+
+        if (generic_call) {
+            has_generic_call = true;
+            seg_id += 1;
+            min_cand = n_cands;
+            for (0..32) |r| {
+                reg[r] = .{ .root = @intCast(r), .ver = next_ver, .delta = 0, .exact_ver = next_ver };
+                next_ver += 1;
+            }
+            continue;
+        }
+
+        if (acc) |a| {
+            switch (a.kind) {
+                .base_imm => {
+                    const rv = reg[a.base];
+                    if (inBounds(a.acc_off) and inBounds(rv.delta + a.acc_off)) {
+                        const off = rv.delta + a.acc_off;
+                        const end = off + @as(i64, a.size);
+                        var matched = false;
+                        var j = n_cands;
+                        while (j > min_cand) {
+                            j -= 1;
+                            const c = &cands[j];
+                            if (c.kind != .base_imm or c.root != rv.root or c.ver != rv.ver) continue;
+                            if (c.seg_id == seg_id) {
+                                const new_min = @min(c.min_off, off);
+                                const new_max = @max(c.max_end, end);
+                                if (new_max - new_min <= max_span) {
+                                    c.min_off = new_min;
+                                    c.max_end = new_max;
+                                    c.is_write = c.is_write or a.is_write;
+                                    c.last_k = @intCast(k);
+                                    c.count += 1;
+                                    op_cand[k] = @intCast(j);
+                                    op_off[k] = off;
+                                    matched = true;
+                                    break;
+                                }
+                            } else {
+                                // After a side exit: reuse only if already covered (no widening or write promotion).
+                                if (off >= c.min_off and end <= c.max_end and (!a.is_write or c.is_write)) {
+                                    c.last_k = @intCast(k);
+                                    c.count += 1;
+                                    op_cand[k] = @intCast(j);
+                                    op_off[k] = off;
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!matched and n_cands < max_cand) {
+                            cands[n_cands] = .{
+                                .kind = .base_imm,
+                                .root = rv.root,
+                                .ver = rv.ver,
+                                .idx_reg = ops.zr,
+                                .idx_ver = 0,
+                                .s1 = 0,
+                                .s2 = 0,
+                                .mask = 0,
+                                .seg_id = seg_id,
+                                .head_k = @intCast(k),
+                                .last_k = @intCast(k),
+                                .head_delta = rv.delta,
+                                .min_off = off,
+                                .max_end = end,
+                                .is_write = a.is_write,
+                                .count = 1,
+                            };
+                            op_cand[k] = @intCast(n_cands);
+                            op_off[k] = off;
+                            n_cands += 1;
+                        }
+                    }
+                },
+                .reg_off => {
+                    const bver = reg[a.base].exact_ver;
+                    const iver: u16 = if (a.idx_reg < 32) reg[a.idx_reg].exact_ver else 0;
+                    const end: i64 = a.size;
+                    var matched = false;
+                    var j = n_cands;
+                    while (j > min_cand) {
+                        j -= 1;
+                        const c = &cands[j];
+                        if (c.kind != .reg_off or c.root != a.base or c.ver != bver or
+                            c.idx_reg != a.idx_reg or c.idx_ver != iver or
+                            c.s1 != a.s1 or c.s2 != a.s2 or c.mask != a.mask) continue;
+                        if (c.seg_id == seg_id) {
+                            const new_max = @max(c.max_end, end);
+                            if (new_max <= max_span) {
+                                c.max_end = new_max;
+                                c.is_write = c.is_write or a.is_write;
+                                c.last_k = @intCast(k);
+                                c.count += 1;
+                                op_cand[k] = @intCast(j);
+                                op_off[k] = 0;
+                                matched = true;
+                                break;
+                            }
+                        } else if (end <= c.max_end and (!a.is_write or c.is_write)) {
+                            c.last_k = @intCast(k);
+                            c.count += 1;
+                            op_cand[k] = @intCast(j);
+                            op_off[k] = 0;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched and n_cands < max_cand) {
+                        cands[n_cands] = .{
+                            .kind = .reg_off,
+                            .root = a.base,
+                            .ver = bver,
+                            .idx_reg = a.idx_reg,
+                            .idx_ver = iver,
+                            .s1 = a.s1,
+                            .s2 = a.s2,
+                            .mask = a.mask,
+                            .seg_id = seg_id,
+                            .head_k = @intCast(k),
+                            .last_k = @intCast(k),
+                            .head_delta = 0,
+                            .min_off = 0,
+                            .max_end = end,
+                            .is_write = a.is_write,
+                            .count = 1,
+                        };
+                        op_cand[k] = @intCast(n_cands);
+                        op_off[k] = 0;
+                        n_cands += 1;
+                    }
+                },
+            }
+            // Apply base writeback, then kill any X load destinations.
+            if (a.wb and !a.wb_kill) {
+                const src = reg[a.base];
+                if (inBounds(a.wb_imm) and inBounds(src.delta + a.wb_imm)) {
+                    reg[a.base] = .{ .root = src.root, .ver = src.ver, .delta = src.delta + a.wb_imm, .exact_ver = next_ver };
+                    next_ver += 1;
+                } else {
+                    reg[a.base] = .{ .root = a.base, .ver = next_ver, .delta = 0, .exact_ver = next_ver };
+                    next_ver += 1;
+                }
+            } else if (a.wb_kill) {
+                reg[a.base] = .{ .root = a.base, .ver = next_ver, .delta = 0, .exact_ver = next_ver };
+                next_ver += 1;
+            }
+            wmask = a.dest_mask;
+        }
+
+        // Kill any X registers written by this op.
+        var m = wmask;
+        while (m != 0) {
+            const r: u8 = @intCast(@ctz(m));
+            m &= m - 1;
+            reg[r] = .{ .root = r, .ver = next_ver, .delta = 0, .exact_ver = next_ver };
+            next_ver += 1;
+        }
+    }
+
+    // Materialize coalesced groups (count >= 2) with linear-scan slot allocation.
+    var cand_to_group: [max_cand]u8 = @splat(no_cand);
+    var slot_end: [max_slots]u8 = @splat(0);
+    var slot_used: [max_slots]bool = @splat(false);
+    var n_groups: u8 = 0;
+    for (0..n_cands) |ci| {
+        const c = &cands[ci];
+        if (c.count < 2 or n_groups >= max_groups) continue;
+        var found: ?u8 = null;
+        for (0..max_slots) |s| {
+            if (!slot_used[s] or slot_end[s] < c.head_k) {
+                found = @intCast(s);
+                break;
+            }
+        }
+        const s = found orelse continue;
+        slot_used[s] = true;
+        slot_end[s] = c.last_k;
+        const span = c.max_end - c.min_off;
+        std.debug.assert(span >= 1 and span <= max_span);
+        e.x.mem.groups[n_groups] = .{
+            .va_off = @intCast(c.min_off - c.head_delta),
+            .span_m1 = @intCast(span - 1),
+            .slot = s,
+            .cache = no_cache,
+            .flags = (if (c.is_write) flag_write else 0) | (if (c.kind == .reg_off) flag_reg else 0),
+        };
+        cand_to_group[ci] = n_groups;
+        n_groups += 1;
+    }
+
+    for (0..n) |k| {
+        const ci = op_cand[k];
+        if (ci == no_cand) continue;
+        const gi = cand_to_group[ci];
+        if (gi == no_cand) continue;
+        const c = &cands[ci];
+        e.x.mem.op_delta[k] = @intCast(op_off[k] - c.min_off);
+        e.x.mem.op_tag[k] = if (k == c.head_k) tag_head + gi else tag_follow + gi;
+    }
+
+    // Assign loop-carried page cache slots for standalone self-loops without generic calls.
+    if (e.rg == null and !has_generic_call) {
+        var next_cache: u8 = 0;
+        for (0..n) |k| {
+            if (!is_mem_op[k] or next_cache >= max_cache) continue;
+            const tag = e.x.mem.op_tag[k];
+            if (tag == 0) {
+                e.x.mem.op_tag[k] = 1 + next_cache;
+                next_cache += 1;
+            } else if (tag >= tag_head and tag < tag_follow) {
+                e.x.mem.groups[tag - tag_head].cache = next_cache;
+                next_cache += 1;
+            }
+        }
+    }
 }
 
 pub fn sync(e: *Emit) void {
@@ -801,4 +1418,111 @@ test "a64 jit mem: stp64_w into decoded code" {
 }
 test "a64 jit mem: stp_q into decoded code" {
     try kt.kind(.stp_q, gen(.stp_q), smc_opt);
+}
+
+// Adversarial generator for intra-block TLB coalescing & self-loop page cache:
+// emits multi-access sequences off shared base registers (spanning page ends,
+// RW->unmapped straddles, RO pages, RWX code pages, 2^64 wraps, page 0),
+// pre/post writeback chains, ADD/MOV base aliasing, base clobbers, RMW pairs,
+// reg-offset RMW, side exits between accesses, and multi-page self-loops.
+fn genCoalesce(r: std.Random, out: []u32, pc0: u64) usize {
+    const pickBase = struct {
+        fn b(rr: std.Random) u32 {
+            return switch (rr.uintLessThan(u32, 8)) {
+                0, 1, 2 => 20, // RW page 0
+                3 => 21, // RW page 1
+                4 => 31, // SP
+                5 => 24, // RO page
+                6 => 23, // unmapped page
+                else => 2, // scratch/clobbered/edge base
+            };
+        }
+    }.b;
+    const rn = pickBase(r);
+    const rt1 = kt.dst(r);
+    const rt2 = kt.dst(r);
+    const off1 = r.uintLessThan(u32, 8); // * 8 = 0..56
+    const off2 = r.uintLessThan(u32, 8);
+    var i: usize = 0;
+    switch (r.uintLessThan(u32, 9)) {
+        0 => { // Two loads off same base (sometimes near a page end)
+            if (r.uintLessThan(u32, 3) == 0) {
+                const t = target(r, 64);
+                if (adr(2, pc0, t)) |a| {
+                    out[i] = a;
+                    i += 1;
+                    out[i] = 0xf940_0000 | (off1 << 10) | (2 << 5) | rt1; // ldr x, [x2, #off1*8]
+                    out[i + 1] = 0xf940_0000 | (off2 << 10) | (2 << 5) | rt2; // ldr x, [x2, #off2*8]
+                    return closeLoop(r, out, pc0, i + 2);
+                }
+            }
+            out[0] = 0xf940_0000 | (off1 << 10) | (rn << 5) | rt1;
+            out[1] = 0xf940_0000 | (off2 << 10) | (rn << 5) | rt2;
+            return closeLoop(r, out, pc0, 2);
+        },
+        1 => { // RMW: load then store at same or nearby offset (hits RO & RWX SMC too)
+            const b = if (r.uintLessThan(u32, 3) == 0) @as(u32, 19) else rn; // x19 = code_va
+            out[0] = 0xf940_0000 | (off1 << 10) | (b << 5) | rt1;
+            out[1] = 0x9100_0400 | (rt1 << 5) | rt1; // add x, x, #1
+            out[2] = 0xf900_0000 | ((if (r.boolean()) off1 else off2) << 10) | (b << 5) | rt1;
+            return closeLoop(r, out, pc0, 3);
+        },
+        2 => { // Pre-index writeback + offset follow (prologue pattern)
+            const b: u32 = if (r.boolean()) 31 else 2;
+            if (b == 2) {
+                if (adr(2, pc0, target(r, 32))) |a| {
+                    out[i] = a;
+                    i += 1;
+                }
+            }
+            out[i] = 0xa9be_0000 | (rt2 << 10) | (b << 5) | rt1; // stp rt1, rt2, [b, #-32]!
+            out[i + 1] = 0xa901_0000 | (rt2 << 10) | (b << 5) | rt1; // stp rt1, rt2, [b, #16]
+            return i + 2;
+        },
+        3 => { // Offset + post-index writeback (epilogue pattern)
+            const b: u32 = if (r.boolean()) 31 else 20;
+            out[0] = 0xa941_0000 | (rt2 << 10) | (b << 5) | rt1; // ldp rt1, rt2, [b, #16]
+            out[1] = 0xa8c2_0000 | (rt2 << 10) | (b << 5) | rt1; // ldp rt1, rt2, [b], #32
+            return 2;
+        },
+        4 => { // ADD/MOV base alias + base overwrite
+            out[0] = 0x9100_4000 | (rn << 5) | 3; // add x3, rn, #16
+            out[1] = 0xf940_0000 | (off1 << 10) | (rn << 5) | rt1;
+            out[2] = 0xf940_0000 | (off2 << 10) | (3 << 5) | rt2;
+            out[3] = 0xf940_0000 | (off1 << 10) | (3 << 5) | 3; // overwrite x3!
+            return 4;
+        },
+        5 => { // Side exit between load and store/load (RO & straddle precision)
+            out[0] = 0xf940_0000 | (off1 << 10) | (rn << 5) | rt1;
+            out[1] = 0xb400_0060 | rt1; // cbz rt1, +12 (side exit)
+            out[2] = (if (r.boolean()) @as(u32, 0xf900_0000) else 0xf940_0000) | (off2 << 10) | (rn << 5) | rt2;
+            return 3;
+        },
+        6 => { // Reg-offset RMW: ldr [rn, x4] then str [rn, x4]
+            const idx_k = r.uintLessThan(u32, 8) * 8;
+            out[0] = 0xd280_0000 | (idx_k << 5) | 4; // movz x4, #idx_k
+            out[1] = 0xf864_6800 | (rn << 5) | rt1; // ldr rt1, [rn, x4]
+            out[2] = 0xf824_6800 | (rn << 5) | rt1; // str rt1, [rn, x4]
+            return closeLoop(r, out, pc0, 3);
+        },
+        7 => { // Self-loop walking across pages (hits page crossings & page 0)
+            out[0] = 0xf841_0400 | (rn << 5) | rt1; // ldr rt1, [rn], #16
+            out[1] = 0xf940_0400 | (rn << 5) | rt2; // ldr rt2, [rn, #8]
+            out[2] = 0x1400_0000 | (@as(u32, @truncate((kt.code_va -% (pc0 + 8)) >> 2)) & 0x3ff_ffff);
+            return 3;
+        },
+        else => { // Q-register RMW pair (ldp q + stp q)
+            const v1 = r.uintLessThan(u32, 32);
+            const v2 = r.uintLessThan(u32, 32);
+            out[0] = 0xad40_0000 | (v2 << 10) | (rn << 5) | v1; // ldp q1, q2, [rn]
+            out[1] = 0xad00_0000 | (v2 << 10) | (rn << 5) | v1; // stp q1, q2, [rn]
+            return closeLoop(r, out, pc0, 2);
+        },
+    }
+}
+
+test "a64 jit mem: intra-block TLB coalescing and self-loop page cache" {
+    try kt.kind(.ldr64_i, genCoalesce, .{ .rounds = 300, .budget = 3000, .seed = 10 });
+    try kt.kind(.ldr64_i, genCoalesce, .{ .rounds = 300, .budget = 3000, .warm_tlb = true, .seed = 11 });
+    try kt.kind(.str64_i, genCoalesce, .{ .rounds = 200, .budget = 3000, .rwx_code = true, .warm_tlb = true, .seed = 12 });
 }

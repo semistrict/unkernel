@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const c = @import("common.zig");
+const paravirt = @import("paravirt.zig");
 
 /// Register-file slots, as u64 indexes from &regs.x (struct kw_regs).
 pub const sp: u8 = 31;
@@ -348,7 +349,8 @@ fn extendXform(option: u32, shift: u32) Xform {
 /// ISB).
 pub fn decode(inst: u32, pc: u64) Decoded {
     return switch (bits(inst, 28, 25)) {
-        0b0000, 0b0001, 0b0010, 0b0011 => generic(inst, pc, true), // UDF, SME, SVE, unallocated
+        0b0000 => generic(inst, pc, !paravirt.isDefined(inst)), // UDF (paravirt stays in block), SME
+        0b0001, 0b0010, 0b0011 => generic(inst, pc, true), // SVE, unallocated
         0b1000, 0b1001 => dpImm(inst, pc),
         0b1010, 0b1011 => branch(inst, pc),
         0b0100, 0b0110, 0b1100, 0b1110 => ldst(inst, pc),

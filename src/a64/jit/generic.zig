@@ -171,9 +171,9 @@ pub fn decode(raw: u32) ?Fast {
             else => return null,
         }
     }
-    // FCMP, FCMPE (single, double; register or #0.0)
+    // FCMP, FCMPE (single, double; register or #0.0; bit 4 = E/signal)
     if (raw & 0xffa0_fc07 == 0x1e20_2000) {
-        return .{ .kind = .fcmp, .n = n, .m = m, .h = @intCast(bits(raw, 22, 22)), .zero = raw & 8 != 0 };
+        return .{ .kind = .fcmp, .n = n, .m = m, .h = @intCast(bits(raw, 22, 22)), .zero = raw & 8 != 0, .op = @intCast(bits(raw, 4, 4)) };
     }
     return decodeFp(raw, d, n, m);
 }
@@ -292,6 +292,35 @@ fn isNan(e: *Emit, r: u8, double: bool) void {
     fp(e, r, double);
     e.op(if (double) W.f64_ne else 0x5c); // f32.ne
 }
+/// Push the i32 "operand is a signalling NaN" (NaN with quiet bit clear).
+fn isSnan(e: *Emit, r: u8, double: bool) void {
+    cm.get(e, vlo(r));
+    if (double) {
+        e.k64(0x7fff_ffff_ffff_ffff);
+        e.op(W.i64_and);
+        e.tee(cm.l_t);
+        e.k64(0x7ff0_0000_0000_0000);
+        e.op(W.i64_gt_u);
+        e.get(cm.l_t);
+        e.k64(0x0008_0000_0000_0000);
+        e.op(W.i64_and);
+        e.op(W.i64_eqz);
+        e.op(W.i32_and);
+    } else {
+        e.op(W.i32_wrap);
+        e.k32(0x7fff_ffff);
+        e.op(W.i32_and);
+        e.op(W.i64_ext_u);
+        e.tee(cm.l_t);
+        e.k64(0x7f80_0000);
+        e.op(W.i64_gt_u);
+        e.get(cm.l_t);
+        e.k64(0x0040_0000);
+        e.op(W.i64_and);
+        e.op(W.i64_eqz);
+        e.op(W.i32_and);
+    }
+}
 
 const fpcr_off = cm.off(ops.nzcv_slot) + 4;
 
@@ -401,24 +430,63 @@ pub fn emit(e: *Emit, f: Fast, at: At) void {
         },
         .fcmp => {
             const dbl = f.h == 1;
-            // NaN operands (FPSR.IOC, unordered) and FPCR.FZ (denormal
-            // operands flushed, FPSR.IDC): the interpreter.
+            loadWasmFp(e, cm.l_t);
+            e.open(W.@"if", W.void_t);
+            // Wasm-FP mode: no FPSR.IOC on NaN, all four outcomes inline.
+            // less: N; equal: Z C; greater: C; unordered (NaN): C V
+            e.k64(c.N);
+            e.k64(c.Z | c.C);
+            e.k64(c.C);
+            e.k64(c.C | c.V);
+            fp(e, f.n, dbl);
+            if (f.zero) fzero(e, dbl) else fp(e, f.m, dbl);
+            e.op(if (dbl) W.f64_gt else 0x5e); // f32.gt
+            e.op(W.select);
+            fp(e, f.n, dbl);
+            if (f.zero) fzero(e, dbl) else fp(e, f.m, dbl);
+            e.op(if (dbl) W.f64_eq else W.f32_eq);
+            e.op(W.select);
+            fp(e, f.n, dbl);
+            if (f.zero) fzero(e, dbl) else fp(e, f.m, dbl);
+            e.op(if (dbl) W.f64_lt else W.f32_lt);
+            e.op(W.select);
+            e.set(cm.l_nzcv);
+            e.op(W.@"else");
+            // FPCR.FZ (denormal operands flushed, FPSR.IDC): hand back.
+            // NaN operands are handled inline (unordered = C|V, IOC on FCMPE or sNaN).
+            e.get(cm.l_t);
+            e.k64(c.FPCR_FZ);
+            e.op(W.i64_and);
+            e.k64(0);
+            e.op(W.i64_ne);
+            e.open(W.@"if", W.void_t);
+            e.handBack(at.k, at.pc);
+            e.close();
             isNan(e, f.n, dbl);
             if (!f.zero) {
                 isNan(e, f.m, dbl);
                 e.op(W.i32_or);
             }
-            e.get(jc.l_x);
-            e.addr();
-            e.mem(W.i32_load, 2, fpcr_off);
-            e.k32(24);
-            e.op(W.i32_shr_u);
-            e.k32(1);
-            e.op(W.i32_and);
-            e.op(W.i32_or);
             e.open(W.@"if", W.void_t);
-            e.handBack(at.k, at.pc);
-            e.close();
+            if (f.op == 1) {
+                e.k64(c.FPSR_IOC);
+                e.set(cm.l_t);
+                orFpsr(e, cm.l_t);
+            } else {
+                isSnan(e, f.n, dbl);
+                if (!f.zero) {
+                    isSnan(e, f.m, dbl);
+                    e.op(W.i32_or);
+                }
+                e.open(W.@"if", W.void_t);
+                e.k64(c.FPSR_IOC);
+                e.set(cm.l_t);
+                orFpsr(e, cm.l_t);
+                e.close();
+            }
+            e.k64(c.C | c.V);
+            e.set(cm.l_nzcv);
+            e.op(W.@"else");
             // less: N; equal: Z C; greater: C
             e.k64(c.N);
             e.k64(c.Z | c.C);
@@ -432,6 +500,8 @@ pub fn emit(e: *Emit, f: Fast, at: At) void {
             e.op(if (dbl) W.f64_lt else W.f32_lt);
             e.op(W.select);
             e.set(cm.l_nzcv);
+            e.close();
+            e.close();
             alu.exactNow(e);
         },
         .farith, .fsqrt, .cvtf, .cvtz, .fcvt, .fminmax, .fmadd => fpFast(e, f, at),
@@ -500,6 +570,7 @@ pub fn emit(e: *Emit, f: Fast, at: At) void {
 
 const fpsr_off = fpcr_off + 4;
 const fpcr_fast_mask: i32 = @bitCast(c.FPCR_FZ | (3 << c.FPCR_RMODE_SHIFT));
+const fpcr_wasm_mask: u64 = c.FPCR_WASM_MASK;
 
 const Fo = struct {
     const f32_abs = 0x8b;
@@ -606,6 +677,27 @@ fn isZero(e: *Emit, l: u32, dbl: bool) void {
     }
 }
 
+/// Push the i32 "the raw bits in local l are finite (biased exponent < max)".
+fn isFinite(e: *Emit, l: u32, dbl: bool) void {
+    const top: u6 = if (dbl) 53 else 56;
+    e.get(l);
+    e.k64(if (dbl) 1 else 33);
+    e.op(W.i64_shl);
+    e.k64(@as(u64, if (dbl) 0x7ff else 0xff) << top);
+    e.op(W.i64_lt_u);
+}
+
+/// Push the i32 "FPCR allows the fast path and both FPSR.IXC and FPSR.UFC are set"
+/// from FPCR and FPSR as `fastIxc` saved them in local l.
+fn fastIxcUfcFrom(e: *Emit, l: u32) void {
+    const flags: u64 = @as(u64, c.FPSR_IXC | c.FPSR_UFC) << 32;
+    e.get(l);
+    e.k64(@as(u64, @as(u32, @bitCast(fpcr_fast_mask))) | flags);
+    e.op(W.i64_and);
+    e.k64(flags);
+    e.op(W.i64_eq);
+}
+
 /// Push the i32 "inRange(l) or +-0.0".
 fn inRangeOrZero(e: *Emit, l: u32, dbl: bool) void {
     inRange(e, l, dbl);
@@ -672,32 +764,31 @@ fn splitD(e: *Emit, l: u32, hi: u32, lo: u32, tmp: u32) void {
     popF(e, lo, true);
 }
 
-/// Push the i32 "FPCR allows the fast path" (round to nearest, FZ = 0).
-fn fpcrFast(e: *Emit) void {
-    e.get(jc.l_x);
-    e.addr();
-    e.mem(W.i32_load, 2, fpcr_off);
-    e.k32(fpcr_fast_mask);
-    e.op(W.i32_and);
-    e.op(W.i32_eqz);
-}
-
-/// Push the i32 "FPCR allows the fast path and FPSR.IXC is set": FPCR and
-/// FPSR (the word after it) in one i64 load, kept in local `save` if any.
-fn fastIxc(e: *Emit, save: ?u32) void {
-    const ixc: u64 = @as(u64, c.FPSR_IXC) << 32;
+/// Load FPCR (low 32) and FPSR (high 32) into local `save` (if any), and
+/// push the i32 "FPCR selects opt-in Wasm-FP / no-FPSR mode".
+fn loadWasmFp(e: *Emit, save: ?u32) void {
     e.get(jc.l_x);
     e.addr();
     e.mem(W.i64_load, 2, fpcr_off);
     if (save) |l| e.tee(l);
+    e.k64(fpcr_wasm_mask);
+    e.op(W.i64_and);
+    e.k64(c.FPCR_WASM_FP);
+    e.op(W.i64_eq);
+}
+
+/// Push the i32 "FPCR allows the fast path and FPSR.IXC is set" from the
+/// FPCR:FPSR word saved in local l.
+fn fastIxcFrom(e: *Emit, l: u32) void {
+    const ixc: u64 = @as(u64, c.FPSR_IXC) << 32;
+    e.get(l);
     e.k64(@as(u64, @as(u32, @bitCast(fpcr_fast_mask))) | ixc);
     e.op(W.i64_and);
     e.k64(ixc);
     e.op(W.i64_eq);
 }
 
-/// Push the i32 "FPCR allows the fast path" from FPCR and FPSR as
-/// `fastIxc` saved them in local l.
+/// Push the i32 "FPCR allows the fast path" from FPCR and FPSR as saved in l.
 fn fastFrom(e: *Emit, l: u32) void {
     e.get(l);
     e.k64(@as(u32, @bitCast(fpcr_fast_mask)));
@@ -705,14 +796,27 @@ fn fastFrom(e: *Emit, l: u32) void {
     e.op(W.i64_eqz);
 }
 
-/// Push the i32 "FPCR.FZ is clear".
-fn fzClear(e: *Emit) void {
-    e.get(jc.l_x);
-    e.addr();
-    e.mem(W.i32_load, 2, fpcr_off);
-    e.k32(@bitCast(c.FPCR_FZ));
-    e.op(W.i32_and);
-    e.op(W.i32_eqz);
+/// Push the i32 "FPCR.FZ is clear" from FPCR and FPSR as saved in l.
+fn fzClearFrom(e: *Emit, l: u32) void {
+    e.get(l);
+    e.k64(c.FPCR_FZ);
+    e.op(W.i64_and);
+    e.op(W.i64_eqz);
+}
+
+/// With SIMD: write lane 0 of v128 local `l` into scalar V register `d`
+/// (zeroing bits 64..127 for double, or 32..127 for single).
+fn setScalarV(e: *Emit, d: u8, l: u32, dbl: bool) void {
+    e.get(l);
+    if (dbl) {
+        cm.setV64(e, d);
+    } else {
+        e.vop(cm.S.v128_const);
+        for (0..16) |_| e.op(0);
+        e.vop(cm.S.i8x16_shuffle);
+        e.ops(&.{ 0, 1, 2, 3, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16 });
+        cm.setV(e, d);
+    }
 }
 
 /// Push the i32 "the i64 mag (an integer magnitude, as the u64 in local l)
@@ -780,38 +884,65 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
     const t2 = cm.l_t + 2;
     const t3 = cm.l_t + 3;
     const t7 = cm.l_t + 7;
-    const ln = if (f.kind == .cvtf) 0 else srcLocal(e, vlo(f.n), cm.l_t + 4);
-    const lm = if (f.kind == .farith or f.kind == .fminmax or f.kind == .fmadd) srcLocal(e, vlo(f.m), cm.l_t + 5) else 0;
-    const la = if (f.kind == .fmadd) srcLocal(e, vlo(f.a), cm.l_t + 6) else 0;
-
-    if (f.kind == .fminmax) {
-        pushF(e, ln, dbl);
-        pushF(e, lm, dbl);
-        fop(e, dbl, if (f.op & 1 != 0) Fo.f64_min else Fo.f64_max, if (f.op & 1 != 0) Fo.f32_min else Fo.f32_max);
-        popF(e, t0, dbl);
-        fzClear(e);
-        pushF(e, t0, dbl);
-        pushF(e, t0, dbl);
-        e.op(if (dbl) W.f64_eq else W.f32_eq);
-        e.op(W.i32_and);
-        e.open(W.@"if", W.void_t);
-        e.get(t0);
-        cm.setScalar(e, vlo(f.d));
-        e.op(W.@"else");
-        fpSlow(e, f, at);
-        e.close();
-        return;
-    }
 
     if (f.kind == .fmadd) {
         const neg_a = (f.op & 2) != 0;
         const neg_p = ((f.op >> 1) ^ (f.op & 1)) != 0;
+        if (e.simd and e.relaxed_fma) {
+            cm.getV(e, f.n);
+            cm.getV(e, f.m);
+            cm.getV(e, f.a);
+            if (neg_a) e.vop(if (dbl) cm.S.f64x2_neg else cm.S.f32x4_neg);
+            e.vop(if (dbl)
+                (if (neg_p) cm.S.f64x2_relaxed_nmadd else cm.S.f64x2_relaxed_madd)
+            else
+                (if (neg_p) cm.S.f32x4_relaxed_nmadd else cm.S.f32x4_relaxed_madd));
+            e.set(cm.l_q);
+            loadWasmFp(e, t7);
+            e.open(W.@"if", W.void_t);
+            setScalarV(e, f.d, cm.l_q, dbl);
+            e.op(W.@"else");
+            e.get(cm.l_q);
+            if (dbl) {
+                e.vlane(cm.S.i64x2_extract_lane, 0);
+            } else {
+                e.vlane(cm.S.i32x4_extract_lane, 0);
+                e.op(W.i64_ext_u);
+            }
+            e.set(t0);
+            inRange(e, t0, dbl);
+            fastIxcFrom(e, t7);
+            e.op(W.i32_and);
+            e.open(W.@"if", W.void_t);
+            setScalarV(e, f.d, cm.l_q, dbl);
+            e.op(W.@"else");
+            fpSlow(e, f, at);
+            e.close();
+            e.close();
+            return;
+        }
+        const ln = srcLocal(e, vlo(f.n), cm.l_t + 4);
+        const lm = srcLocal(e, vlo(f.m), cm.l_t + 5);
+        const la = srcLocal(e, vlo(f.a), cm.l_t + 6);
+        loadWasmFp(e, t3);
+        e.open(W.@"if", W.void_t);
+        pushF(e, ln, dbl);
+        if (neg_p) fop(e, dbl, Fo.f64_neg, Fo.f32_neg);
+        pushF(e, lm, dbl);
+        fop(e, dbl, Fo.f64_mul, Fo.f32_mul);
+        pushF(e, la, dbl);
+        if (neg_a) fop(e, dbl, Fo.f64_neg, Fo.f32_neg);
+        fop(e, dbl, Fo.f64_add, Fo.f32_add);
+        popF(e, t0, dbl);
+        e.get(t0);
+        cm.setScalar(e, vlo(f.d));
+        e.op(W.@"else");
         // One test of FPCR, FPSR.IXC and the operands: a block for IXC
         // alone first made the IXC-set path slower (V8, 2026-11-24) than
         // the range checks cost IXC clear (next to the interpreter call).
         e.k64(0);
         e.set(t7);
-        fastIxc(e, null);
+        fastIxcFrom(e, t3);
         if (!dbl) {
             inRangeOrZero(e, ln, false);
             inRangeOrZero(e, lm, false);
@@ -923,11 +1054,39 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
         e.op(W.@"else");
         fpSlow(e, f, at);
         e.close();
+        e.close();
         return;
     }
 
-    // The result in t0 (SCVTF/UCVTF: the integer in t3), and the i32 "the
-    // result is one that no flag but IXC goes with" (see above).
+    const ln = if (f.kind == .cvtf) 0 else srcLocal(e, vlo(f.n), cm.l_t + 4);
+    const lm = if (f.kind == .farith or f.kind == .fminmax) srcLocal(e, vlo(f.m), cm.l_t + 5) else 0;
+
+    if (f.kind == .fminmax) {
+        pushF(e, ln, dbl);
+        pushF(e, lm, dbl);
+        fop(e, dbl, if (f.op & 1 != 0) Fo.f64_min else Fo.f64_max, if (f.op & 1 != 0) Fo.f32_min else Fo.f32_max);
+        popF(e, t0, dbl);
+        loadWasmFp(e, t7);
+        e.open(W.@"if", W.void_t);
+        e.get(t0);
+        cm.setScalar(e, vlo(f.d));
+        e.op(W.@"else");
+        fzClearFrom(e, t7);
+        pushF(e, t0, dbl);
+        pushF(e, t0, dbl);
+        e.op(if (dbl) W.f64_eq else W.f32_eq);
+        e.op(W.i32_and);
+        e.open(W.@"if", W.void_t);
+        e.get(t0);
+        cm.setScalar(e, vlo(f.d));
+        e.op(W.@"else");
+        fpSlow(e, f, at);
+        e.close();
+        e.close();
+        return;
+    }
+
+    // Compute the bare Wasm result into t0 (SCVTF/UCVTF: the integer in t3).
     switch (f.kind) {
         .farith => {
             pushF(e, ln, dbl);
@@ -944,13 +1103,11 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
                 else => Fo.f32_sub,
             });
             popF(e, t0, dbl);
-            inRange(e, t0, dbl);
         },
         .fsqrt => {
             pushF(e, ln, dbl);
             fop(e, dbl, Fo.f64_sqrt, Fo.f32_sqrt);
             popF(e, t0, dbl);
-            inRange(e, t0, dbl);
         },
         .cvtf => {
             // The integer, sign- or zero-extended from W.
@@ -967,18 +1124,28 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
                 (if (f.op == 1) Fo.f64_convert_i64_u else Fo.f64_convert_i64_s)
             else if (f.op == 1) Fo.f32_convert_i64_u else Fo.f32_convert_i64_s);
             popF(e, t0, dbl);
-            e.k32(1);
         },
         .fcvt => if (dbl) {
-            // Sd = Dn: the rounded single must be in range.
             pushF(e, ln, true);
             e.op(Fo.f32_demote);
             popF(e, t0, false);
-            inRange(e, t0, false);
         } else {
-            // Dd = Sn: exact; not for a NaN (quieted, payload rules).
             pushSD(e, ln);
             popF(e, t0, true);
+        },
+        else => unreachable,
+    }
+    loadWasmFp(e, t7);
+    e.open(W.@"if", W.void_t);
+    e.get(t0);
+    cm.setScalar(e, vlo(f.d));
+    e.op(W.@"else");
+    // Strict ARM64 hot path: result in range and FPSR.IXC set already
+    // (FCVT to double is never inexact). t7 holds FPCR and FPSR.
+    switch (f.kind) {
+        .farith, .fsqrt => inRange(e, t0, dbl),
+        .cvtf => e.k32(1),
+        .fcvt => if (dbl) inRange(e, t0, false) else {
             e.get(ln);
             e.k64(0x7fff_ffff);
             e.op(W.i64_and);
@@ -987,9 +1154,7 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
         },
         else => unreachable,
     }
-    // The hot path: FPSR.IXC set already (FCVT to double is never inexact),
-    // so the result is all there is to write. t7 keeps FPCR and FPSR.
-    if (f.kind == .fcvt and !dbl) fpcrFast(e) else fastIxc(e, t7);
+    if (f.kind == .fcvt and !dbl) fastFrom(e, t7) else fastIxcFrom(e, t7);
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(t0);
@@ -997,57 +1162,60 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
     e.op(W.@"else");
     if (f.kind == .fcvt and !dbl) {
         fpSlow(e, f, at);
-        e.close();
-        return;
-    }
-    // The cold path. Past the hot test, FPCR fast and a result in range
-    // mean IXC clear: IXC is ORed in when the result is inexact, which is
-    // stored only then (an exact loop stores nothing for the next op's
-    // FPCR/FPSR load to wait on), before Vd is written (without SIMD, ln
-    // and lm are the registers' own locals, and Vd may be one of them).
-    // Then the exact zeros.
-    switch (f.kind) {
-        .farith => if (f.op >= 2) { // FADD, FSUB
-            // TwoSum (exact without overflow, and with denormals): bb = r - a,
-            // err = (a - (r - bb)) + (b' - bb); a zero sum has err = 0.
-            pushF(e, t0, dbl);
-            pushF(e, ln, dbl);
-            fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
-            popF(e, t2, dbl);
-            pushF(e, ln, dbl);
-            pushF(e, t0, dbl);
-            pushF(e, t2, dbl);
-            fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
-            fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
-            pushF(e, lm, dbl);
-            if (f.op == 3) fop(e, dbl, Fo.f64_neg, Fo.f32_neg);
-            pushF(e, t2, dbl);
-            fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
-            fop(e, dbl, Fo.f64_add, Fo.f32_add);
-            popF(e, t3, dbl);
-            // fast: in range or zero, err finite (err - err == 0)
-            inRangeOrZero(e, t0, dbl);
-            pushF(e, t3, dbl);
-            pushF(e, t3, dbl);
-            fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
-            if (dbl) e.kf(0.0) else f32zero(e);
-            e.op(if (dbl) W.f64_eq else W.f32_eq);
-            e.op(W.i32_and);
-            fastFrom(e, t7);
+    } else switch (f.kind) {
+        .farith, .fsqrt => {
+            // If FPCR is fast and both IXC and UFC are already set, any finite
+            // result (including subnormals and underflow to +-0.0) cannot raise
+            // any new flag and wasm's IEEE-754 RNE result is bit-exact.
+            fastIxcUfcFrom(e, t7);
+            isFinite(e, t0, dbl);
             e.op(W.i32_and);
             e.open(W.@"if", W.void_t);
-            // inexact = err != 0
-            pushF(e, t3, dbl);
-            if (dbl) e.kf(0.0) else f32zero(e);
-            fop(e, dbl, Fo.f64_ne, Fo.f32_ne);
-            orIxcIf(e);
             e.get(t0);
             cm.setScalar(e, vlo(f.d));
             e.op(W.@"else");
-            fpSlow(e, f, at);
+            if (f.kind == .farith and f.op >= 2) { // FADD, FSUB
+                // TwoSum (exact without overflow, and with denormals): bb = r - a,
+                // err = (a - (r - bb)) + (b' - bb); a zero sum has err = 0.
+                pushF(e, t0, dbl);
+                pushF(e, ln, dbl);
+                fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
+                popF(e, t2, dbl);
+                pushF(e, ln, dbl);
+                pushF(e, t0, dbl);
+                pushF(e, t2, dbl);
+                fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
+                fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
+                pushF(e, lm, dbl);
+                if (f.op == 3) fop(e, dbl, Fo.f64_neg, Fo.f32_neg);
+                pushF(e, t2, dbl);
+                fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
+                fop(e, dbl, Fo.f64_add, Fo.f32_add);
+                popF(e, t3, dbl);
+                // fast: in range or zero, err finite (err - err == 0)
+                inRangeOrZero(e, t0, dbl);
+                pushF(e, t3, dbl);
+                pushF(e, t3, dbl);
+                fop(e, dbl, Fo.f64_sub, Fo.f32_sub);
+                if (dbl) e.kf(0.0) else f32zero(e);
+                e.op(if (dbl) W.f64_eq else W.f32_eq);
+                e.op(W.i32_and);
+                fastFrom(e, t7);
+                e.op(W.i32_and);
+                e.open(W.@"if", W.void_t);
+                // inexact = err != 0
+                pushF(e, t3, dbl);
+                if (dbl) e.kf(0.0) else f32zero(e);
+                fop(e, dbl, Fo.f64_ne, Fo.f32_ne);
+                orIxcIf(e);
+                e.get(t0);
+                cm.setScalar(e, vlo(f.d));
+                e.op(W.@"else");
+                fpSlow(e, f, at);
+                e.close();
+            } else coldExactOrZero(e, f, at, dbl, ln, lm);
             e.close();
-        } else coldExactOrZero(e, f, at, dbl, ln, lm),
-        .fsqrt => coldExactOrZero(e, f, at, dbl, ln, lm),
+        },
         .cvtf => {
             fastFrom(e, t7);
             e.open(W.@"if", W.void_t);
@@ -1094,6 +1262,7 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
         },
         else => unreachable,
     }
+    e.close();
     e.close();
 }
 
@@ -1190,7 +1359,16 @@ fn cvtz(e: *Emit, f: Fast, at: At) void {
     const t0 = cm.l_t;
     const t1 = cm.l_t + 1;
     const t2 = cm.l_t + 2;
+    const t3 = cm.l_t + 3;
     const ln = srcLocal(e, vlo(f.n), cm.l_t + 4);
+    loadWasmFp(e, t3);
+    e.open(W.@"if", W.void_t);
+    pushF(e, ln, f.h == 1);
+    e.op(0xfc);
+    e.uleb((@as(u32, @intFromBool(f.q)) << 2) | (@as(u32, f.h) << 1) | @as(u32, f.op));
+    if (!f.q) e.op(W.i64_ext_u);
+    cm.set(e, xs(f.d));
+    e.op(W.@"else");
     if (f.h == 1) pushF(e, ln, true) else pushSD(e, ln);
     e.op(Fo.i64_reinterpret);
     e.set(t2);
@@ -1207,7 +1385,7 @@ fn cvtz(e: *Emit, f: Fast, at: At) void {
     // saturated: NaN 0, negative min, positive max
     const smin: u64 = if (f.op == 1) 0 else @as(u64, 1) << width;
     const smax: u64 = if (f.op == 1) umax else (@as(u64, 1) << width) - 1;
-    fzClear(e);
+    fzClearFrom(e, t3);
     e.open(W.@"if", W.void_t);
     pushF(e, t2, true);
     e.kf(lo);
@@ -1251,6 +1429,7 @@ fn cvtz(e: *Emit, f: Fast, at: At) void {
     orFpsr(e, t1);
     e.op(W.@"else");
     fpSlow(e, f, at);
+    e.close();
     e.close();
 }
 

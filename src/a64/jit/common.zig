@@ -29,9 +29,9 @@ const W = jc.W;
 //            between exits (lazy flags), the epilogue stores it
 //   13..20   l_t + 0..7: scratch of one op's code (any family; never live
 //            from one op to the next)
-//   21..28   l_alu + 0..7: alu.zig's (lazy flags)
-//   29..32   l_br + 0..3: branch.zig's
-//   33..36   l_mem + 0..3: mem.zig's
+//   21..24   l_alu + 0..3: alu.zig's (lazy flags)
+//   25..33   l_mcache + 0..8: mem.zig's self-loop page cache (3 x page/add/lim)
+//   34..36   l_mem + 0..2: mem.zig's coalesced group host addresses
 //   37..68   X0..X30, SP (slot s: 37 + s)
 //   69       TPIDR_EL0
 //   70       l_vtmp: with SIMD, the lane value `set` puts into a V register
@@ -57,11 +57,11 @@ pub const l_nzcv: u32 = 12;
 pub const l_t: u32 = 13;
 pub const n_t = 8;
 pub const l_alu: u32 = 21;
-pub const n_alu = 8;
-pub const l_br: u32 = 29;
-pub const n_br = 4;
-pub const l_mem: u32 = 33;
-pub const n_mem = 4;
+pub const n_alu = 4;
+pub const l_mcache: u32 = 25;
+pub const n_mcache = 9;
+pub const l_mem: u32 = 34;
+pub const n_mem = 3;
 const l_xbase: u32 = 37;
 const l_tpidr: u32 = 69;
 pub const l_vtmp: u32 = 70;
@@ -80,7 +80,7 @@ pub const n_locals_simd: u32 = l_w + n_w;
 
 comptime {
     std.debug.assert(l_region + jc.n_region_locals == l_nzcv);
-    std.debug.assert(l_t + n_t == l_alu and l_alu + n_alu == l_br and l_br + n_br == l_mem and l_mem + n_mem == l_xbase);
+    std.debug.assert(l_t + n_t == l_alu and l_alu + n_alu == l_mcache and l_mcache + n_mcache == l_mem and l_mem + n_mem == l_xbase);
     std.debug.assert(l_xbase + 32 == l_tpidr);
 }
 
@@ -311,6 +311,10 @@ pub const S = struct {
     pub const i32x4_trunc_sat_f32x4_u = 0xf9;
     pub const f32x4_convert_i32x4_s = 0xfa;
     pub const f32x4_convert_i32x4_u = 0xfb;
+    pub const f32x4_relaxed_madd = 0x105;
+    pub const f32x4_relaxed_nmadd = 0x106;
+    pub const f64x2_relaxed_madd = 0x107;
+    pub const f64x2_relaxed_nmadd = 0x108;
 };
 
 /// Use bit of an X/SP slot (0..31); none for XZR (slot 32) and other slots.
