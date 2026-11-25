@@ -478,7 +478,7 @@ pub const Cpu = extern struct {
     }
 
     /// Host address of `va` for a read (no straddle handling).
-    inline fn readHost(self: *Cpu, va: u64) core.Error!u64 {
+    pub inline fn readHost(self: *Cpu, va: u64) core.Error!u64 {
         const vpn = va >> page_shift;
         const e = &self.priv.tlb_r[@intCast(vpn & (dtlb_n - 1))];
         if (e.tag == vpn) return va +% e.add;
@@ -508,7 +508,7 @@ pub const Cpu = extern struct {
 
     /// Host address of `va` for a write of `len` bytes that stays in the
     /// page; handles stores into pages with decoded code.
-    fn writeHost(self: *Cpu, va: u64, len: u64) core.Error!u64 {
+    pub fn writeHost(self: *Cpu, va: u64, len: u64) core.Error!u64 {
         const vpn = va >> page_shift;
         const i: usize = @intCast(vpn & (dtlb_n - 1));
         const e = &self.priv.tlb_w[i];
@@ -834,6 +834,54 @@ pub const Cpu = extern struct {
                 if (self.priv.tlb_w[@intCast(vpn & (dtlb_n - 1))].tag & ~code_flag != vpn) _ = try self.translate(va, .write);
             },
             .exec => _ = try self.execHost(va),
+        }
+    }
+
+    /// Fault now unless every 4 KiB page intersecting `[va, va + len)` may be
+    /// accessed as `access`. Walks the upper Sv48 levels once per 2 MiB L0
+    /// table and scans L0 PTEs directly (without thrashing the 1024-entry TLB),
+    /// matching `translate` on every permission, A/D, reserved and VA-range
+    /// check.
+    pub fn probeRange(self: *Cpu, va: u64, len: u64, access: core.Access) core.Error!void {
+        if (len == 0) return;
+        const need: u64 = switch (access) {
+            .read => pte_v | pte_r | pte_u | pte_a,
+            .write => pte_v | pte_w | pte_u | pte_a | pte_d,
+            .exec => pte_v | pte_x | pte_u | pte_a,
+        };
+        var cur = va;
+        var rem = len;
+        if (len <= 16 * page_size) {
+            while (rem > 0) {
+                try self.probe(cur, access);
+                const step = @min(rem, page_size - (cur & page_mask));
+                cur +%= step;
+                rem -= step;
+            }
+            return;
+        }
+        while (rem > 0) {
+            if (cur >> 48 != 0) return self.fault(cur, access);
+            var table = self.pgd;
+            inline for (.{ @as(u6, 3), @as(u6, 2), @as(u6, 1) }) |level| {
+                const idx = (cur >> (page_shift + 9 * level)) & 511;
+                const e = hostLoad(u64, self.phys_base +% table +% idx * 8);
+                if (e & pte_v == 0 or e & (pte_r | pte_w | pte_x) != 0) {
+                    return self.fault(cur, access);
+                }
+                table = ((e >> 10) & ppn_mask) << page_shift;
+            }
+            const l0_base = self.phys_base +% table;
+            var idx0: u64 = (cur >> page_shift) & 511;
+            while (idx0 < 512 and rem > 0) : (idx0 += 1) {
+                const e = hostLoad(u64, l0_base +% idx0 * 8);
+                if (e & need != need or (e & (pte_w | pte_r) == pte_w)) {
+                    return self.fault(cur, access);
+                }
+                const step = @min(rem, page_size - (cur & page_mask));
+                cur +%= step;
+                rem -= step;
+            }
         }
     }
 
