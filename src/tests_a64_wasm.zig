@@ -16,4 +16,5 @@ test {
     _ = @import("a64/jit/emit.zig");
     _ = jit_tests;
     _ = @import("emu/kwemu.zig"); // kw_debug_cpu_of_jit_buf
+    _ = @import("emu/fatwasm.zig");
 }
